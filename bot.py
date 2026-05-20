@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт с самостоятельным поиском в интернете (Google).
+Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт (без авто-поиска, с запросом источников).
 """
 
 import asyncio
@@ -13,7 +13,6 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
-from googlesearch import search  # pip install google-search
 
 # ============================================
 # CONFIGURATION
@@ -30,9 +29,6 @@ MONITORING_ENABLED = True
 HISTORY_FILE = "history.json"
 MAX_HISTORY = 200
 
-# Включить автоматический поиск в интернете (можно отключить админом)
-AUTO_WEB_SEARCH = True
-
 user_history = defaultdict(list)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,41 +43,25 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# ФУНКЦИЯ ПОИСКА В ИНТЕРНЕТЕ
+# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА (без авто-поиска, требует источники)
 # ============================================
-async def search_web(query: str, num_results: int = 5) -> list:
-    """Ищет в Google и возвращает список словарей {'title': ..., 'url': ..., 'snippet': ...}"""
-    results = []
-    try:
-        # Выполняем поиск синхронно, но в отдельном потоке, чтобы не блокировать event loop
-        loop = asyncio.get_event_loop()
-        search_results = await loop.run_in_executor(
-            None, lambda: list(search(query, num_results=num_results, advanced=True))
-        )
-        for result in search_results:
-            results.append({
-                "title": result.title,
-                "url": result.url,
-                "snippet": result.description
-            })
-        logger.info(f"Поиск по запросу '{query}' вернул {len(results)} результатов")
-    except Exception as e:
-        logger.error(f"Ошибка поиска Google: {e}")
-    return results
+EXPERT_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
+Твоя задача — анализировать матчи и давать советы, строго следуя методологии из 5 шагов.
 
-# ============================================
-# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА (с использованием результатов поиска)
-# ============================================
-SPORTS_ANALYST_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
-Твоя задача — анализировать матчи на основе предоставленной информации и результатов интернет-поиска.
+ВАЖНЕЙШЕЕ ПРАВИЛО: Ты НЕ ИЩЕШЬ информацию в интернете самостоятельно. Если у тебя нет актуальных данных о травмах, составах, мотивации — ты ДОЛЖЕН запросить их у пользователя. Не выдумывай факты, не гадай.
 
-ВАЖНО: если тебе переданы результаты поиска, ты обязан использовать их как основные источники. Не выдумывай факты, ссылайся на найденную информацию.
+Когда пользователь предоставляет ссылки или конкретную информацию — используй их как источник. Указывай, откуда взяты данные (например: «согласно ссылке 1»). Если пользователь не дал источники, а ты не уверен — честно скажи, что информации недостаточно, и попроси предоставить ссылки на новости или официальные составы.
 
-Следуй методологии (5 шагов) и всегда указывай источник (ссылку) для каждого утверждения. Если источник не указан — считай, что это твоё мнение, но лучше найти подтверждение.
+Методология (выполняй последовательно):
+1. Кадровый аудит (травмы, дисквы) — нужны источники.
+2. Прогноз состава и тактики — основывайся на новостях или прошлых матчах.
+3. Турнирная мотивация — проверяй таблицу, положение команд.
+4. Фактор усталости (календарь, перелёты) — запрашивай данные.
+5. Верификация за час до игры — смотри официальные составы.
 
-Если поиск не дал результатов, честно скажи об этом и предложи пользователю предоставить ссылки вручную.
+Если пользователь не предоставил никакой информации, задай уточняющие вопросы: какой матч, когда, какие есть новости, ссылки.
 
-Ты должен говорить правду, не гадать, не выдумывать. Если чего-то не знаешь — так и скажи."""
+Ты должен быть максимально полезным и точным, но никогда не жертвовать правдивостью. Лучше сказать «я не знаю, нужны источники», чем дать ложный прогноз."""
 
 # ============================================
 # ЗАГРУЗКА / СОХРАНЕНИЕ ИСТОРИИ
@@ -108,28 +88,12 @@ def save_history():
 load_history()
 
 # ============================================
-# AI ОТВЕТ С ПОИСКОМ
+# AI ОТВЕТ (без поиска)
 # ============================================
-async def get_ai_response(user_id: int, user_message: str, perform_search: bool = True) -> str:
+async def get_ai_response(user_id: int, user_message: str) -> str:
     history = user_history[user_id]
-    # Определяем, нужно ли искать в интернете
-    search_context = ""
-    if AUTO_WEB_SEARCH and perform_search and len(user_message) > 10:
-        # Улучшим запрос: убираем лишние слова, добавляем "футбол травмы состав"
-        search_query = user_message[:100] + " травмы состав прогноз"
-        results = await search_web(search_query, num_results=3)
-        if results:
-            search_context = "\n\nРезультаты поиска в интернете (источники):\n"
-            for i, res in enumerate(results, 1):
-                search_context += f"{i}. {res['title']} - {res['url']}\n   {res['snippet']}\n"
-        else:
-            search_context = "\n\n(Поиск не дал результатов. Пользователь может предоставить ссылки вручную.)"
-    
-    # Формируем системный промпт
-    system_prompt = SPORTS_ANALYST_PROMPT + "\n\n" + search_context if search_context else SPORTS_ANALYST_PROMPT
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-20:])  # последние 10 пар сообщений, чтобы не перегружать
+    messages = [{"role": "system", "content": EXPERT_PROMPT}]
+    messages.extend(history[-20:])  # последние 20 сообщений для контекста
     messages.append({"role": "user", "content": user_message})
     try:
         response = await deepseek_client.chat.completions.create(
@@ -139,7 +103,6 @@ async def get_ai_response(user_id: int, user_message: str, perform_search: bool 
             max_tokens=1500
         )
         answer = response.choices[0].message.content
-        # Обновляем историю
         user_history[user_id].append({"role": "user", "content": user_message})
         user_history[user_id].append({"role": "assistant", "content": answer})
         if len(user_history[user_id]) > MAX_HISTORY * 2:
@@ -156,21 +119,14 @@ async def get_ai_response(user_id: int, user_message: str, perform_search: bool 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🤖 Эксперт по ставкам на спорт с автоматическим поиском в интернете.\n"
-        "Я сам ищу актуальную информацию (травмы, составы, новости) и даю прогнозы по методологии.\n\n"
+        "🤖 Эксперт по ставкам на спорт.\n"
+        "Присылайте матчи и ссылки на новости (травмы, составы).\n"
+        "Я не ищу информацию сам — вы должны предоставить источники, чтобы я мог дать точный прогноз по методологии.\n\n"
         "Команды:\n"
-        "/toggle_search – вкл/выкл автоматический поиск (админ)\n"
         "/clear_history – очистить историю\n"
-        "/admin_stats – статистика"
+        "/admin_stats – статистика (админ)\n"
+        "/toggle_monitor – вкл/выкл мониторинг канала"
     )
-
-@dp.message(Command("toggle_search"))
-async def toggle_search(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    global AUTO_WEB_SEARCH
-    AUTO_WEB_SEARCH = not AUTO_WEB_SEARCH
-    await message.answer(f"Автоматический поиск в интернете {'включён' if AUTO_WEB_SEARCH else 'выключен'}.")
 
 @dp.message(Command("clear_history"))
 async def clear_history(message: types.Message):
@@ -180,21 +136,31 @@ async def clear_history(message: types.Message):
         save_history()
         await message.answer("✅ История очищена.")
     else:
-        await message.answer("Истории нет.")
+        await message.answer("Нет сохранённой истории.")
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID:
+        await message.answer("Нет прав.")
         return
     bot_info = await message.bot.get_me()
     await message.answer(
-        f"Статус\nБот: @{bot_info.username}\n"
-        f"Поиск: {'ВКЛ' if AUTO_WEB_SEARCH else 'ВЫКЛ'}\n"
+        f"Статус бота\n"
+        f"Username: @{bot_info.username}\n"
+        f"Мониторинг: {'ВКЛ' if MONITORING_ENABLED else 'ВЫКЛ'}\n"
         f"Пользователей: {len(user_history)}"
     )
 
+@dp.message(Command("toggle_monitor"))
+async def toggle_monitor(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    global MONITORING_ENABLED
+    MONITORING_ENABLED = not MONITORING_ENABLED
+    await message.answer(f"Мониторинг канала {'включён' if MONITORING_ENABLED else 'выключен'}.")
+
 # ============================================
-# МОНИТОРИНГ КАНАЛА (тоже с поиском)
+# МОНИТОРИНГ КАНАЛА
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -205,7 +171,7 @@ async def handle_channel_post(post: types.Message):
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    comment = await get_ai_response(ADMIN_ID, f"Проанализируй этот пост как эксперт по ставкам, используй поиск если нужно: {text}", perform_search=True)
+    comment = await get_ai_response(ADMIN_ID, f"Проанализируй этот пост как эксперт по ставкам. Пост: {text}")
     try:
         await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 Пост в канале:\n{text}\n\n💬 Анализ бота:\n{comment}")
     except Exception as e:
@@ -225,7 +191,7 @@ async def group_chat(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text, perform_search=True)
+    answer = await get_ai_response(message.from_user.id, message.text)
     await message.reply(answer)
 
 # ============================================
@@ -238,7 +204,7 @@ async def private_response(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text, perform_search=True)
+    answer = await get_ai_response(message.from_user.id, message.text)
     await message.reply(answer)
 
 # ============================================
@@ -258,7 +224,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот-эксперт с поиском Google запущен.")
+    logger.info("🚀 Бот-эксперт (без авто-поиска, запрашивает источники) запущен.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
