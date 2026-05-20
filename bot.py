@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot with DeepSeek + Admin & Moderation
-Debug version: shows user ID when admin check fails.
+Subscription check DISABLED, fixed username error.
 """
 
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types, BaseMiddleware
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
@@ -14,19 +14,18 @@ from aiohttp import web
 import os
 
 # ============================================
-# CONFIGURATION — ALL IDS ARE SET
+# CONFIGURATION
 # ============================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8535231779:AAFU4goz5X8ZqgDJV4MKzXyHDEHWpAEvbD0")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-3ff13ab1a93f4a099554f788b553e5e0")
-ADMIN_IDS = [682446170]                     # your Telegram ID (as integer)
+ADMIN_IDS = [682446170]
 
-# IDs you provided via @userinfobot
-CHANNEL_ID = -1003154677228                 # your channel ID
-GROUP_ID = -1002688844179                   # your group ID (for moderation)
+CHANNEL_ID = -1003154677228
+GROUP_ID = -1002688844179
 
-# Feature toggles
-REQUIRE_SUBSCRIPTION = Fasle                 # require users to subscribe to channel
-ENABLE_MODERATION = True                    # auto-delete forbidden words/links in group
+# IMPORTANT: subscription check is OFF
+REQUIRE_SUBSCRIPTION = False
+ENABLE_MODERATION = True
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -52,31 +51,6 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# MIDDLEWARE: SUBSCRIPTION CHECK
-# ============================================
-class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        if not REQUIRE_SUBSCRIPTION or not CHANNEL_ID:
-            return await handler(event, data)
-        user_id = event.from_user.id
-        # skip check for admins
-        if user_id in ADMIN_IDS:
-            return await handler(event, data)
-        try:
-            member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-            if member.status in ["member", "administrator", "creator"]:
-                return await handler(event, data)
-            else:
-                await event.answer("❌ Для использования бота подпишитесь на канал.")
-                return
-        except Exception as e:
-            logger.error(f"Subscription check error: {e}")
-            return await handler(event, data)
-
-dp.message.middleware(SubscriptionMiddleware())
-dp.callback_query.middleware(SubscriptionMiddleware())
-
-# ============================================
 # COMMON COMMANDS
 # ============================================
 @dp.message(Command("start"))
@@ -88,7 +62,7 @@ async def cmd_start(message: types.Message):
         "/start - это сообщение\n"
         "/help - справка\n"
         "/about - информация\n\n"
-        "👑 Админ-команды (только для вас):\n"
+        "👑 Админ-команды:\n"
         "/admin_stats - статистика\n"
         "/post текст - отправить пост в канал\n"
         "/pin message_id - закрепить сообщение\n"
@@ -104,41 +78,34 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("about"))
 async def cmd_about(message: types.Message):
-    await message.answer("ℹ️ Бот создан для управления каналом и группой с помощью ИИ. Версия 2.1 (debug)")
+    await message.answer("ℹ️ Бот создан для управления каналом и группой. Версия 2.3 (исправлена ошибка username)")
 
 # ============================================
-# ADMIN COMMANDS (with debug output)
+# ADMIN COMMANDS
 # ============================================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
-    user_id = message.from_user.id
-    logger.info(f"admin_stats called by user {user_id}, ADMIN_IDS = {ADMIN_IDS}")
-    if user_id not in ADMIN_IDS:
-        await message.answer(
-            f"⛔ У вас нет прав администратора.\n"
-            f"Ваш ID: {user_id}\n"
-            f"Ожидается ID администратора: {ADMIN_IDS}"
-        )
+    if not is_admin(message.from_user.id):
+        await message.answer(f"⛔ У вас нет прав администратора. Ваш ID: {message.from_user.id}")
         return
+    bot_info = await message.bot.get_me()
     await message.answer(
         f"🤖 *Статистика бота:*\n"
-        f"ID бота: {message.bot.id}\n"
-        f"Имя: @{message.bot.username}\n"
+        f"ID бота: {bot_info.id}\n"
+        f"Имя: @{bot_info.username}\n"
         f"Администратор: {ADMIN_IDS[0]}\n"
         f"Канал ID: {CHANNEL_ID}\n"
         f"Группа ID: {GROUP_ID}\n"
-        f"Модерация: {'вкл' if ENABLE_MODERATION else 'выкл'}\n"
-        f"Обязательная подписка: {'вкл' if REQUIRE_SUBSCRIPTION else 'выкл'}",
+        f"Модерация: {'вкл' if ENABLE_MODERATION else 'выкл'}",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("post"))
 async def send_post(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет прав администратора.")
         return
     text = message.text.replace("/post", "", 1).strip()
     if not text:
@@ -245,7 +212,7 @@ async def moderate_group_messages(message: types.Message):
         return
 
 # ============================================
-# AI RESPONSE (catch-all for non-command private messages)
+# AI RESPONSE
 # ============================================
 @dp.message()
 async def ai_response(message: types.Message):
@@ -290,7 +257,7 @@ async def run_http_server():
 # MAIN
 # ============================================
 async def main():
-    logger.info("🚀 Запуск бота с предустановленными ID канала и группы...")
+    logger.info("🚀 Запуск бота (проверка подписки ОТКЛЮЧЕНА, исправлена ошибка username)")
     await asyncio.gather(
         dp.start_polling(bot),
         run_http_server()
