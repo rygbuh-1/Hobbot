@@ -11,10 +11,10 @@ ADMIN_IDS = [682446170]  # ваш Telegram ID
 
 # ID канала, который будет администрировать бот (пример: -1001234567890)
 # Узнать ID канала можно, переслав любое сообщение из канала боту @userinfobot
-CHANNEL_ID = os.getenv("CHANNEL_ID", None)  # Замените на ваш ID канала
+CHANNEL_ID = os.getenv("-1003154677228", None)  # Замените на ваш ID канала
 
 # ID супергруппы, привязанной к каналу (для модерации)
-GROUP_ID = os.getenv("GROUP_ID", None)
+GROUP_ID = os.getenv("-1002688844179", None)
 
 # Включить обязательную подписку на канал перед использованием бота
 REQUIRE_SUBSCRIPTION = True
