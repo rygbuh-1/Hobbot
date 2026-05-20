@@ -2,6 +2,7 @@
 """
 Telegram AI Bot with DeepSeek – FINAL VERSION.
 Responds to ALL text messages in the group (not just commands).
+Fixed SyntaxError: global declaration before usage.
 """
 
 import asyncio
@@ -25,13 +26,12 @@ ADMIN_ID = 682446170
 CHANNEL_ID = -1003154677228
 SETTINGS_FILE = "settings.json"
 
-# Feature toggles
-ENABLE_MODERATION = True    # удаление мата и ссылок
+ENABLE_MODERATION = True
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 
 PORT = int(os.getenv("PORT", "8080"))
 
-# State
+# State (will be loaded from file)
 GROUP_TALK_ENABLED = True
 GROUP_ID = None
 
@@ -40,7 +40,7 @@ user_history = defaultdict(list)
 MAX_HISTORY = 10
 
 # ============================================
-# LOAD/SAVE SETTINGS
+# LOAD SETTINGS
 # ============================================
 def load_settings():
     global GROUP_ID, GROUP_TALK_ENABLED
@@ -52,8 +52,15 @@ def load_settings():
                 GROUP_TALK_ENABLED = data.get("group_talk_enabled", True)
         except:
             pass
-load_settings()
 
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump({"group_id": GROUP_ID, "group_talk_enabled": GROUP_TALK_ENABLED}, f)
+
+load_settings()
+# ============================================
+# LOGGING
+# ============================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -94,13 +101,6 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
         return f"⚠️ Ошибка: {str(e)}"
-
-# ============================================
-# SAVE SETTINGS
-# ============================================
-def save_settings():
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump({"group_id": GROUP_ID, "group_talk_enabled": GROUP_TALK_ENABLED}, f)
 
 # ============================================
 # COMMON COMMANDS
@@ -164,13 +164,12 @@ async def toggle_group_chat(message: types.Message):
 
 @dp.message(Command("test"))
 async def test_command(message: types.Message):
-    """Простая проверка: бот отвечает в группе"""
     if message.chat.type in ["group", "supergroup"]:
         await message.reply("✅ Бот работает и видит это сообщение!")
     else:
         await message.answer("✅ Тест в личке.")
 
-# Остальные админ-команды (сокращённо, но рабочие)
+# Other admin commands (short versions)
 @dp.message(Command("post"))
 async def send_post(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -260,12 +259,13 @@ async def check_subscription(message: types.Message):
 async def on_my_chat_member(update: types.ChatMemberUpdated):
     if update.new_chat_member.status in ["member", "administrator"]:
         chat = update.chat
-        if chat.type in ["group", "supergroup"] and GROUP_ID is None:
+        if chat.type in ["group", "supergroup"]:
             global GROUP_ID
-            GROUP_ID = chat.id
-            save_settings()
-            logger.info(f"Auto-set group ID to {GROUP_ID}")
-            await bot.send_message(chat.id, "✅ Бот добавлен. Группа сохранена. Теперь я буду отвечать на сообщения.")
+            if GROUP_ID is None:
+                GROUP_ID = chat.id
+                save_settings()
+                logger.info(f"Auto-set group ID to {GROUP_ID}")
+                await bot.send_message(chat.id, "✅ Бот добавлен. Группа сохранена. Теперь я буду отвечать на сообщения.")
 
 # ============================================
 # MODERATION (delete bad words/links)
@@ -295,21 +295,16 @@ async def moderate_group_messages(message: types.Message):
 # ============================================
 @dp.message()
 async def ai_response_group(message: types.Message):
-    # Проверяем, что это наша группа
     if not GROUP_ID:
         return
     if message.chat.id != GROUP_ID:
         return
-    # Проверяем, включён ли режим общения
     if not GROUP_TALK_ENABLED:
         return
-    # Не отвечаем самому себе
     if message.from_user.id == bot.id:
         return
-    # Игнорируем команды (начинаются с /)
     if message.text and message.text.startswith("/"):
         return
-    # Игнорируем пустые сообщения
     if not message.text:
         return
 
@@ -338,24 +333,28 @@ async def ai_response_private(message: types.Message):
     await message.reply(answer)
 
 # ============================================
-# HEALTH CHECK
+# HEALTH CHECK SERVER
 # ============================================
 async def health_check(request):
-    return web.Response(text="OK")
+    return web.Response(text="OK", status=200)
 
-async def run_http():
+async def run_http_server():
     app = web.Application()
-    app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+    app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    logger.info(f"✅ Health check on port {PORT}")
     await asyncio.Event().wait()
 
 async def main():
     logger.info("🚀 Финальная версия: бот отвечает на все сообщения в группе")
-    await asyncio.gather(dp.start_polling(bot), run_http())
+    await asyncio.gather(
+        dp.start_polling(bot),
+        run_http_server()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
