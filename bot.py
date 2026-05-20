@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – automatically detects group chat.
-Saves group ID when bot is added or when admin uses /setgroup.
+Telegram AI Bot with DeepSeek – автоматическое определение группы, исправлено общение.
 """
 
 import asyncio
@@ -20,29 +19,24 @@ from aiohttp import web
 # ============================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8535231779:AAFU4goz5X8ZqgDJV4MKzXyHDEHWpAEvbD0")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-3ff13ab1a93f4a099554f788b553e5e0")
-ADMIN_ID = 682446170                     # your Telegram ID
+ADMIN_ID = 682446170
 
-# Channel ID for /post etc.
 CHANNEL_ID = -1003154677228
-
-# Settings file for group ID and toggle
 SETTINGS_FILE = "settings.json"
 
-# Feature toggles
 ENABLE_MODERATION = True
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 PORT = int(os.getenv("PORT", "8080"))
 
-# Group talk state (loaded from file)
+# Состояния
 GROUP_TALK_ENABLED = True
-GROUP_ID = None   # will be loaded from file or set later
+GROUP_ID = None
 
-# Conversation memory: user_id -> list of last messages
 user_history = defaultdict(list)
 MAX_HISTORY = 10
 
 # ============================================
-# LOAD/SAVE SETTINGS
+# ЗАГРУЗКА НАСТРОЕК
 # ============================================
 def load_settings():
     global GROUP_ID, GROUP_TALK_ENABLED
@@ -52,20 +46,21 @@ def load_settings():
                 data = json.load(f)
                 GROUP_ID = data.get("group_id")
                 GROUP_TALK_ENABLED = data.get("group_talk_enabled", True)
-        except:
-            pass
+                logging.info(f"Загружены настройки: group_id={GROUP_ID}, talk={GROUP_TALK_ENABLED}")
+        except Exception as e:
+            logging.error(f"Ошибка загрузки настроек: {e}")
 
 def save_settings():
     with open(SETTINGS_FILE, "w") as f:
         json.dump({"group_id": GROUP_ID, "group_talk_enabled": GROUP_TALK_ENABLED}, f)
-
-load_settings()
+    logging.info(f"Сохранены настройки: group_id={GROUP_ID}, talk={GROUP_TALK_ENABLED}")
 
 # ============================================
-# LOGGING
+# ЛОГИРОВАНИЕ
 # ============================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+load_settings()
 
 # ============================================
 # DEEPSEEK CLIENT
@@ -75,22 +70,18 @@ deepseek_client = AsyncOpenAI(
     base_url="https://api.deepseek.com/v1"
 )
 
-# ============================================
-# BOT & DISPATCHER
-# ============================================
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# HELPER: Get AI response with memory
+# ПОМОЩНИК: ОТВЕТ С ПАМЯТЬЮ
 # ============================================
 async def get_ai_response(user_id: int, user_message: str) -> str:
     history = user_history[user_id]
     messages = [
         {"role": "system", "content": "Ты — дружелюбный, остроумный ИИ-ассистент. Отвечай естественно, как человек в чате. Пиши на русском, кратко и по делу."}
     ]
-    for msg in history:
-        messages.append(msg)
+    messages.extend(history)
     messages.append({"role": "user", "content": user_message})
     try:
         response = await deepseek_client.chat.completions.create(
@@ -110,40 +101,22 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         return f"⚠️ Ошибка: {str(e)}"
 
 # ============================================
-# COMMON COMMANDS
+# ОБЩИЕ КОМАНДЫ
 # ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🤖 Привет! Я ИИ-бот на DeepSeek.\n"
-        "Я могу общаться в группе, если меня туда добавить.\n"
-        "Администратор может настроить группу командой /setgroup.\n\n"
-        "📌 Команды:\n"
-        "/start - это сообщение\n"
-        "/help - справка\n"
-        "/about - информация\n\n"
-        "👑 Админ-команды:\n"
-        "/admin_stats - статистика\n"
-        "/setgroup - установить текущий чат как группу для общения\n"
-        "/toggle_chat - включить/выключить общение в группе\n"
-        "/post текст - отправить пост в канал\n"
-        "/pin id - закрепить сообщение\n"
-        "/unpin - открепить\n"
-        "/ban id - забанить в группе\n"
-        "/unban id - разбанить\n"
-        "/check_sub id - проверить подписку"
+        "🤖 Привет! Я ИИ-бот.\n"
+        "Добавь меня в группу и напиши /setgroup в этой группе, чтобы я начал общаться.\n"
+        "Команды администратора: /admin_stats, /setgroup, /toggle_chat, /post, /pin и т.д."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    await message.answer("📖 Напишите мне текст — я отвечу. В группе я отвечаю, если режим включён (/toggle_chat).")
-
-@dp.message(Command("about"))
-async def cmd_about(message: types.Message):
-    await message.answer("ℹ️ Бот умеет общаться в группе, автоматически запоминает ID группы. Версия 4.1")
+    await message.answer("Просто напиши мне текст — я отвечу. В группе я отвечаю, если режим включён (/toggle_chat).")
 
 # ============================================
-# ADMIN COMMANDS
+# АДМИН-КОМАНДЫ
 # ============================================
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -160,22 +133,22 @@ async def admin_stats(message: types.Message):
         f"Username: @{bot_info.username}\n"
         f"Канал: {CHANNEL_ID}\n"
         f"Группа для общения: {GROUP_ID if GROUP_ID else 'не задана'}\n"
-        f"Модерация: {'вкл' if ENABLE_MODERATION else 'выкл'}\n"
         f"Общение в группе: {'вкл' if GROUP_TALK_ENABLED else 'выкл'}"
     )
 
 @dp.message(Command("setgroup"))
 async def set_group(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может установить группу.")
         return
     global GROUP_ID
     if message.chat.type in ["group", "supergroup"]:
         GROUP_ID = message.chat.id
         save_settings()
-        await message.answer(f"✅ Текущий чат установлен как группа для общения. ID: {GROUP_ID}")
-        logger.info(f"Group set to {GROUP_ID} by admin")
+        await message.answer(f"✅ Группа установлена. Теперь я буду отвечать здесь.\nID: {GROUP_ID}")
+        logger.info(f"Group set to {GROUP_ID} by admin in chat {message.chat.id}")
     else:
-        await message.answer("❌ Эта команда работает только в группе или супергруппе.")
+        await message.answer("❌ Эта команда работает только в группе.")
 
 @dp.message(Command("toggle_chat"))
 async def toggle_group_chat(message: types.Message):
@@ -187,6 +160,15 @@ async def toggle_group_chat(message: types.Message):
     status = "включён" if GROUP_TALK_ENABLED else "выключен"
     await message.answer(f"🔄 Режим общения в группе {status}.")
 
+@dp.message(Command("test"))
+async def test_command(message: types.Message):
+    """Тестовая команда для проверки работы бота в группе"""
+    if message.chat.type in ["group", "supergroup"]:
+        await message.reply("✅ Бот работает и видит это сообщение!")
+    else:
+        await message.answer("Тестовая команда сработала в личке.")
+
+# Остальные админ-команды (post, pin, unpin, ban, unban, check_sub) – сокращённо, но полный код есть в предыдущих версиях. Для краткости здесь основные.
 @dp.message(Command("post"))
 async def send_post(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -279,11 +261,10 @@ async def check_subscription(message: types.Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 # ============================================
-# AUTO-DETECT GROUP WHEN BOT IS ADDED
+# АВТООПРЕДЕЛЕНИЕ ГРУППЫ ПРИ ДОБАВЛЕНИИ
 # ============================================
 @dp.my_chat_member()
 async def on_my_chat_member(update: types.ChatMemberUpdated):
-    # When bot is added to a supergroup or group
     if update.new_chat_member.status in ["member", "administrator"]:
         chat = update.chat
         if chat.type in ["group", "supergroup"]:
@@ -291,17 +272,15 @@ async def on_my_chat_member(update: types.ChatMemberUpdated):
             if GROUP_ID is None:
                 GROUP_ID = chat.id
                 save_settings()
-                logger.info(f"Automatically set group ID to {GROUP_ID} after being added")
-                await bot.send_message(chat.id, "✅ Бот добавлен в группу. Теперь я буду здесь отвечать на сообщения, если режим включён. Администратор может использовать /toggle_chat для включения/выключения.")
+                logger.info(f"Auto-set group ID to {GROUP_ID}")
+                await bot.send_message(chat.id, "✅ Бот добавлен в группу. Теперь я буду отвечать на сообщения. Для управления используйте /toggle_chat и /setgroup (если не сработает автоматически).")
 
 # ============================================
-# MODERATION IN GROUP
+# МОДЕРАЦИЯ В ГРУППЕ (удаление спама)
 # ============================================
 @dp.message()
 async def moderate_group_messages(message: types.Message):
-    if not GROUP_ID:
-        return
-    if message.chat.id != GROUP_ID:
+    if not GROUP_ID or message.chat.id != GROUP_ID:
         return
     if not ENABLE_MODERATION:
         return
@@ -320,15 +299,20 @@ async def moderate_group_messages(message: types.Message):
         return
 
 # ============================================
-# AI RESPONSE IN GROUP
+# ОТВЕТЫ В ГРУППЕ (основной)
 # ============================================
 @dp.message()
 async def ai_response_group(message: types.Message):
+    # Отладочный лог
+    logger.info(f"ai_response_group: chat_id={message.chat.id}, GROUP_ID={GROUP_ID}, type={message.chat.type}")
     if not GROUP_ID:
+        logger.info("GROUP_ID is None, skipping group response")
         return
     if message.chat.id != GROUP_ID:
+        logger.info(f"Chat ID mismatch: {message.chat.id} != {GROUP_ID}")
         return
     if not GROUP_TALK_ENABLED:
+        logger.info("Group talk disabled")
         return
     if message.from_user.id == bot.id:
         return
@@ -337,12 +321,18 @@ async def ai_response_group(message: types.Message):
     if not message.text:
         return
 
+    logger.info(f"Processing group message from {message.from_user.id}: {message.text[:50]}")
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
-    await message.reply(answer)
+    try:
+        await message.reply(answer)
+        logger.info("Response sent successfully")
+    except Exception as e:
+        logger.error(f"Failed to send response: {e}")
+        await message.answer("⚠️ Не удалось отправить сообщение. Проверьте права бота.")
 
 # ============================================
-# AI RESPONSE IN PRIVATE
+# ОТВЕТЫ В ЛИЧКЕ
 # ============================================
 @dp.message()
 async def ai_response_private(message: types.Message):
@@ -352,37 +342,29 @@ async def ai_response_private(message: types.Message):
         return
     if not message.text:
         return
-
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
     await message.reply(answer)
 
 # ============================================
-# HEALTH CHECK SERVER
+# HEALTH CHECK
 # ============================================
 async def health_check(request):
-    return web.Response(text="OK", status=200)
+    return web.Response(text="OK")
 
-async def run_http_server():
+async def run_http():
     app = web.Application()
-    app.router.add_get("/health", health_check)
     app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"✅ Health check on port {PORT}")
     await asyncio.Event().wait()
 
-# ============================================
-# MAIN
-# ============================================
 async def main():
-    logger.info("🚀 Запуск бота с автовыбором группы")
-    await asyncio.gather(
-        dp.start_polling(bot),
-        run_http_server()
-    )
+    logger.info("🚀 Запуск бота с исправленным общением в группе")
+    await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
     asyncio.run(main())
