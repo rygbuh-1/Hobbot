@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт (без авто-поиска, с запросом источников).
+Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт с авто-поиском (SerpAPI).
 """
 
 import asyncio
 import logging
 import os
 import json
+import aiohttp
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -15,10 +16,15 @@ from openai import AsyncOpenAI
 from aiohttp import web
 
 # ============================================
-# CONFIGURATION
+# КЛЮЧИ (встроены, но для безопасности лучше через env)
 # ============================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8535231779:AAFU4goz5X8ZqgDJV4MKzXyHDEHWpAEvbD0")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-3ff13ab1a93f4a099554f788b553e5e0")
+TELEGRAM_TOKEN = "8535231779:AAFU4goz5X8ZqgDJV4MKzXyHDEHWpAEvbD0"
+DEEPSEEK_API_KEY = "sk-3ff13ab1a93f4a099554f788b553e5e0"
+SERPAPI_KEY = "3ed7bf5fee50fcbe3e6783bb00d5e43843b94da518017d47ebeb148fc0e265c9"
+
+# ============================================
+# НАСТРОЙКИ
+# ============================================
 ADMIN_ID = 682446170
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -27,13 +33,16 @@ TARGET_GROUP_ID = -1002688844179
 MONITORING_ENABLED = True
 
 HISTORY_FILE = "history.json"
-MAX_HISTORY = 200
-
-user_history = defaultdict(list)
+MAX_HISTORY = 50  # храним последние 50 сообщений на пользователя
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+user_history = defaultdict(list)
+
+# ============================================
+# ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
+# ============================================
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1"
@@ -43,25 +52,56 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА (без авто-поиска, требует источники)
+# ФУНКЦИЯ ПОИСКА ЧЕРЕЗ SERPAPI
+# ============================================
+async def search_web(query: str, num_results: int = 5) -> str:
+    """Выполняет поиск через SerpAPI и возвращает форматированный текст со ссылками."""
+    params = {
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "engine": "google",
+        "num": num_results,
+        "hl": "ru",          # язык русский
+        "gl": "ru"           # регион Россия (можно изменить)
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://serpapi.com/search", params=params) as resp:
+                data = await resp.json()
+                results = data.get("organic_results", [])
+                if not results:
+                    return "❌ Не удалось найти информацию по запросу."
+                answer = "🔍 **Результаты поиска (источники):**\n\n"
+                for i, res in enumerate(results[:num_results], 1):
+                    title = res.get("title", "Без заголовка")
+                    link = res.get("link", "#")
+                    snippet = res.get("snippet", "Нет описания")
+                    answer += f"{i}. **{title}**\n   {snippet}\n   {link}\n\n"
+                return answer
+    except Exception as e:
+        logger.error(f"Ошибка SerpAPI: {e}")
+        return "⚠️ Ошибка при поиске. Попробуйте позже."
+
+# ============================================
+# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА (с использованием поиска)
 # ============================================
 EXPERT_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
-Твоя задача — анализировать матчи и давать советы, строго следуя методологии из 5 шагов.
+Твоя задача — анализировать матчи на основе методологии из 5 шагов и предоставленных результатов поиска.
 
-ВАЖНЕЙШЕЕ ПРАВИЛО: Ты НЕ ИЩЕШЬ информацию в интернете самостоятельно. Если у тебя нет актуальных данных о травмах, составах, мотивации — ты ДОЛЖЕН запросить их у пользователя. Не выдумывай факты, не гадай.
+Ты ОБЯЗАН использовать информацию из поисковой выдачи (ссылки, заголовки, сниппеты) как основные источники.
+Для каждого утверждения указывай источник: «Согласно [название источника](ссылка) …».
+Если поиск не дал нужной информации, честно скажи об этом и попроси пользователя уточнить запрос или предоставить дополнительные данные.
 
-Когда пользователь предоставляет ссылки или конкретную информацию — используй их как источник. Указывай, откуда взяты данные (например: «согласно ссылке 1»). Если пользователь не дал источники, а ты не уверен — честно скажи, что информации недостаточно, и попроси предоставить ссылки на новости или официальные составы.
+Не выдумывай факты. Если информации недостаточно — дай общий анализ, но пометь, что он основан на твоих знаниях (до апреля 2025) и может быть неактуален.
 
-Методология (выполняй последовательно):
-1. Кадровый аудит (травмы, дисквы) — нужны источники.
-2. Прогноз состава и тактики — основывайся на новостях или прошлых матчах.
-3. Турнирная мотивация — проверяй таблицу, положение команд.
-4. Фактор усталости (календарь, перелёты) — запрашивай данные.
-5. Верификация за час до игры — смотри официальные составы.
+Методология (применяй последовательно):
+1. Кадровый аудит (травмы, дисквалификации) — ищи в найденных статьях.
+2. Прогноз состава и тактики — опирайся на новости о тренировках и пресс-конференции.
+3. Турнирная мотивация — проверь положение в таблице (если есть в выдаче).
+4. Фактор усталости (календарь, логистика) — ищи информацию о перелётах, отдыхе.
+5. Верификация данных (за час до матча) — посоветуй сверить официальные составы.
 
-Если пользователь не предоставил никакой информации, задай уточняющие вопросы: какой матч, когда, какие есть новости, ссылки.
-
-Ты должен быть максимально полезным и точным, но никогда не жертвовать правдивостью. Лучше сказать «я не знаю, нужны источники», чем дать ложный прогноз."""
+Будь объективен, краток, но информативен. Всегда указывай ссылки на источники."""
 
 # ============================================
 # ЗАГРУЗКА / СОХРАНЕНИЕ ИСТОРИИ
@@ -88,21 +128,32 @@ def save_history():
 load_history()
 
 # ============================================
-# AI ОТВЕТ (без поиска)
+# AI ОТВЕТ С АВТО-ПОИСКОМ
 # ============================================
 async def get_ai_response(user_id: int, user_message: str) -> str:
-    history = user_history[user_id]
+    # Выполняем поиск по запросу пользователя (улучшаем запрос для спорта)
+    search_query = user_message + " травмы состав прогноз"
+    search_results = await search_web(search_query, num_results=4)
+    
+    # Формируем контекст для DeepSeek
+    context = f"Пользователь спрашивает: {user_message}\n\n{search_results}\n\n"
+    context += "Теперь, используя информацию из поиска (если она есть), дай развернутый анализ по методологии. Если поиск не дал конкретики, укажи это и дай общие рекомендации."
+    
+    # Берём историю (последние 10 пар)
+    history = user_history[user_id][-20:]  # 10 сообщений туда-обратно
     messages = [{"role": "system", "content": EXPERT_PROMPT}]
-    messages.extend(history[-20:])  # последние 20 сообщений для контекста
-    messages.append({"role": "user", "content": user_message})
+    messages.extend(history)
+    messages.append({"role": "user", "content": context})
+    
     try:
         response = await deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             temperature=0.7,
-            max_tokens=1500
+            max_tokens=1800
         )
         answer = response.choices[0].message.content
+        # Сохраняем в историю (без контекста поиска, только вопрос и ответ)
         user_history[user_id].append({"role": "user", "content": user_message})
         user_history[user_id].append({"role": "assistant", "content": answer})
         if len(user_history[user_id]) > MAX_HISTORY * 2:
@@ -119,13 +170,14 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🤖 Эксперт по ставкам на спорт.\n"
-        "Присылайте матчи и ссылки на новости (травмы, составы).\n"
-        "Я не ищу информацию сам — вы должны предоставить источники, чтобы я мог дать точный прогноз по методологии.\n\n"
-        "Команды:\n"
-        "/clear_history – очистить историю\n"
+        "🤖 **Эксперт по ставкам на спорт с авто-поиском**\n\n"
+        "Я сам ищу актуальную информацию (травмы, составы, новости) через Google и даю прогнозы по методологии из 5 шагов.\n"
+        "Просто напиши название матча, и я проанализирую.\n\n"
+        "📌 Команды:\n"
+        "/clear_history – очистить историю диалога\n"
         "/admin_stats – статистика (админ)\n"
-        "/toggle_monitor – вкл/выкл мониторинг канала"
+        "/toggle_monitor – вкл/выкл комментирование постов из канала",
+        parse_mode="Markdown"
     )
 
 @dp.message(Command("clear_history"))
@@ -134,9 +186,9 @@ async def clear_history(message: types.Message):
     if user_id in user_history:
         del user_history[user_id]
         save_history()
-        await message.answer("✅ История очищена.")
+        await message.answer("✅ История диалога очищена.")
     else:
-        await message.answer("Нет сохранённой истории.")
+        await message.answer("У вас нет сохранённой истории.")
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
@@ -145,10 +197,11 @@ async def admin_stats(message: types.Message):
         return
     bot_info = await message.bot.get_me()
     await message.answer(
-        f"Статус бота\n"
+        f"**Статус бота**\n"
         f"Username: @{bot_info.username}\n"
-        f"Мониторинг: {'ВКЛ' if MONITORING_ENABLED else 'ВЫКЛ'}\n"
-        f"Пользователей: {len(user_history)}"
+        f"Мониторинг канала: {'✅ ВКЛ' if MONITORING_ENABLED else '❌ ВЫКЛ'}\n"
+        f"Пользователей в истории: {len(user_history)}",
+        parse_mode="Markdown"
     )
 
 @dp.message(Command("toggle_monitor"))
@@ -159,8 +212,12 @@ async def toggle_monitor(message: types.Message):
     MONITORING_ENABLED = not MONITORING_ENABLED
     await message.answer(f"Мониторинг канала {'включён' if MONITORING_ENABLED else 'выключен'}.")
 
+@dp.message(Command("test"))
+async def test_cmd(message: types.Message):
+    await message.reply("✅ Бот активен, поиск работает.")
+
 # ============================================
-# МОНИТОРИНГ КАНАЛА
+# МОНИТОРИНГ КАНАЛА (комментирование постов)
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -171,9 +228,11 @@ async def handle_channel_post(post: types.Message):
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    comment = await get_ai_response(ADMIN_ID, f"Проанализируй этот пост как эксперт по ставкам. Пост: {text}")
+    logger.info(f"Новый пост в канале: {text[:100]}")
+    # Генерируем комментарий через AI с поиском
+    comment = await get_ai_response(ADMIN_ID, f"Прокомментируй этот пост как эксперт по ставкам: {text}")
     try:
-        await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 Пост в канале:\n{text}\n\n💬 Анализ бота:\n{comment}")
+        await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 **Новый пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Ошибка отправки комментария: {e}")
 
@@ -192,10 +251,13 @@ async def group_chat(message: types.Message):
         return
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
-    await message.reply(answer)
+    try:
+        await message.reply(answer)
+    except Exception as e:
+        logger.error(f"Ошибка ответа в группе: {e}")
 
 # ============================================
-# ЛИЧКА
+# ЛИЧНЫЕ СООБЩЕНИЯ
 # ============================================
 @dp.message()
 async def private_response(message: types.Message):
@@ -208,7 +270,7 @@ async def private_response(message: types.Message):
     await message.reply(answer)
 
 # ============================================
-# HEALTH CHECK
+# HEALTH CHECK СЕРВЕР
 # ============================================
 async def health_check(request):
     return web.Response(text="OK")
@@ -224,7 +286,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот-эксперт (без авто-поиска, запрашивает источники) запущен.")
+    logger.info("🚀 Бот-эксперт с авто-поиском (SerpAPI) запущен.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
