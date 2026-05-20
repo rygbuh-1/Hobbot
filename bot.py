@@ -115,6 +115,7 @@ def is_admin(user_id: int) -> bool:
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
         return
     await message.answer(
         f"🤖 *Статистика бота:*\n"
@@ -131,6 +132,7 @@ async def admin_stats(message: types.Message):
 @dp.message(Command("post"))
 async def send_post(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
         return
     text = message.text.replace("/post", "", 1).strip()
     if not text:
