@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт с авто-поиском (SerpAPI).
+Исправлено: разбивка длинных сообщений на части.
 """
 
 import asyncio
@@ -16,7 +17,7 @@ from openai import AsyncOpenAI
 from aiohttp import web
 
 # ============================================
-# КЛЮЧИ (встроены, но для безопасности лучше через env)
+# КЛЮЧИ (встроены)
 # ============================================
 TELEGRAM_TOKEN = "8535231779:AAFU4goz5X8ZqgDJV4MKzXyHDEHWpAEvbD0"
 DEEPSEEK_API_KEY = "sk-3ff13ab1a93f4a099554f788b553e5e0"
@@ -33,16 +34,13 @@ TARGET_GROUP_ID = -1002688844179
 MONITORING_ENABLED = True
 
 HISTORY_FILE = "history.json"
-MAX_HISTORY = 50  # храним последние 50 сообщений на пользователя
+MAX_HISTORY = 50
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 user_history = defaultdict(list)
 
-# ============================================
-# ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
-# ============================================
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1"
@@ -52,17 +50,34 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
+# ФУНКЦИЯ РАЗБИВКИ ДЛИННЫХ СООБЩЕНИЙ
+# ============================================
+async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
+    """Отправляет сообщение, разбивая на части если нужно (лимит Telegram 4096 символов)."""
+    if not text:
+        return
+    # Разбиваем по 4000 символов, чтобы оставить запас
+    for i in range(0, len(text), 4000):
+        part = text[i:i+4000]
+        if reply_to_message_id and i == 0:
+            await bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
+        else:
+            await bot.send_message(chat_id, part)
+        # Небольшая пауза между частями, чтобы не спамить
+        await asyncio.sleep(0.5)
+
+# ============================================
 # ФУНКЦИЯ ПОИСКА ЧЕРЕЗ SERPAPI
 # ============================================
-async def search_web(query: str, num_results: int = 5) -> str:
+async def search_web(query: str, num_results: int = 4) -> str:
     """Выполняет поиск через SerpAPI и возвращает форматированный текст со ссылками."""
     params = {
         "q": query,
         "api_key": SERPAPI_KEY,
         "engine": "google",
         "num": num_results,
-        "hl": "ru",          # язык русский
-        "gl": "ru"           # регион Россия (можно изменить)
+        "hl": "ru",
+        "gl": "ru"
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -83,7 +98,7 @@ async def search_web(query: str, num_results: int = 5) -> str:
         return "⚠️ Ошибка при поиске. Попробуйте позже."
 
 # ============================================
-# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА (с использованием поиска)
+# СИСТЕМНЫЙ ПРОМПТ ЭКСПЕРТА
 # ============================================
 EXPERT_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
 Твоя задача — анализировать матчи на основе методологии из 5 шагов и предоставленных результатов поиска.
@@ -131,16 +146,13 @@ load_history()
 # AI ОТВЕТ С АВТО-ПОИСКОМ
 # ============================================
 async def get_ai_response(user_id: int, user_message: str) -> str:
-    # Выполняем поиск по запросу пользователя (улучшаем запрос для спорта)
     search_query = user_message + " травмы состав прогноз"
     search_results = await search_web(search_query, num_results=4)
     
-    # Формируем контекст для DeepSeek
     context = f"Пользователь спрашивает: {user_message}\n\n{search_results}\n\n"
     context += "Теперь, используя информацию из поиска (если она есть), дай развернутый анализ по методологии. Если поиск не дал конкретики, укажи это и дай общие рекомендации."
     
-    # Берём историю (последние 10 пар)
-    history = user_history[user_id][-20:]  # 10 сообщений туда-обратно
+    history = user_history[user_id][-20:]
     messages = [{"role": "system", "content": EXPERT_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": context})
@@ -150,10 +162,9 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             model="deepseek-chat",
             messages=messages,
             temperature=0.7,
-            max_tokens=1800
+            max_tokens=2000
         )
         answer = response.choices[0].message.content
-        # Сохраняем в историю (без контекста поиска, только вопрос и ответ)
         user_history[user_id].append({"role": "user", "content": user_message})
         user_history[user_id].append({"role": "assistant", "content": answer})
         if len(user_history[user_id]) > MAX_HISTORY * 2:
@@ -169,16 +180,14 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
 # ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer(
+    await safe_send(message.chat.id,
         "🤖 **Эксперт по ставкам на спорт с авто-поиском**\n\n"
         "Я сам ищу актуальную информацию (травмы, составы, новости) через Google и даю прогнозы по методологии из 5 шагов.\n"
         "Просто напиши название матча, и я проанализирую.\n\n"
         "📌 Команды:\n"
         "/clear_history – очистить историю диалога\n"
         "/admin_stats – статистика (админ)\n"
-        "/toggle_monitor – вкл/выкл комментирование постов из канала",
-        parse_mode="Markdown"
-    )
+        "/toggle_monitor – вкл/выкл комментирование постов из канала")
 
 @dp.message(Command("clear_history"))
 async def clear_history(message: types.Message):
@@ -217,7 +226,7 @@ async def test_cmd(message: types.Message):
     await message.reply("✅ Бот активен, поиск работает.")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (комментирование постов)
+# МОНИТОРИНГ КАНАЛА
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -229,12 +238,8 @@ async def handle_channel_post(post: types.Message):
     if not text:
         text = "[Пост без текста]"
     logger.info(f"Новый пост в канале: {text[:100]}")
-    # Генерируем комментарий через AI с поиском
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй этот пост как эксперт по ставкам: {text}")
-    try:
-        await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 **Новый пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}", parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка отправки комментария: {e}")
+    await safe_send(TARGET_GROUP_ID, f"📢 **Новый пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
 
 # ============================================
 # ОБЩЕНИЕ В ГРУППЕ
@@ -251,10 +256,7 @@ async def group_chat(message: types.Message):
         return
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
-    try:
-        await message.reply(answer)
-    except Exception as e:
-        logger.error(f"Ошибка ответа в группе: {e}")
+    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
 
 # ============================================
 # ЛИЧНЫЕ СООБЩЕНИЯ
@@ -267,10 +269,10 @@ async def private_response(message: types.Message):
         return
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
-    await message.reply(answer)
+    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
 
 # ============================================
-# HEALTH CHECK СЕРВЕР
+# HEALTH CHECK
 # ============================================
 async def health_check(request):
     return web.Response(text="OK")
@@ -286,7 +288,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот-эксперт с авто-поиском (SerpAPI) запущен.")
+    logger.info("🚀 Бот-эксперт с авто-поиском (SerpAPI) и разбивкой длинных сообщений запущен.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
