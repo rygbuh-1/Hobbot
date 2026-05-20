@@ -124,3 +124,9 @@ async def check_subscription(message: types.Message):
         await message.answer(f"Пользователь {user_id} подписан на канал: {'✅ да' if is_member else '❌ нет'}")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
+        @router.message(Command("admin_stats"))
+async def admin_stats(message: types.Message):
+    print(f"DEBUG: admin_stats вызвана. User ID: {message.from_user.id}, ADMIN_IDS: {ADMIN_IDS}")
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
