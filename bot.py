@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek + Admin & Moderation
-Now talks in the group chat like a human.
+Telegram AI Bot with DeepSeek – automatically detects group chat.
+Saves group ID when bot is added or when admin uses /setgroup.
 """
 
 import asyncio
 import logging
+import json
+import os
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
-import os
 
 # ============================================
 # CONFIGURATION
@@ -21,23 +22,44 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8535231779:AAFU4goz5X8ZqgDJV4MKzXy
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-3ff13ab1a93f4a099554f788b553e5e0")
 ADMIN_ID = 682446170                     # your Telegram ID
 
-CHANNEL_ID = -1003154677228              # your channel ID (for posts)
-GROUP_ID = -1002688844179                # your group ID where bot will talk
+# Channel ID for /post etc.
+CHANNEL_ID = -1003154677228
+
+# Settings file for group ID and toggle
+SETTINGS_FILE = "settings.json"
 
 # Feature toggles
-REQUIRE_SUBSCRIPTION = False             # disabled
 ENABLE_MODERATION = True
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
-
 PORT = int(os.getenv("PORT", "8080"))
 
-# Group talking mode (can be toggled by admin)
+# Group talk state (loaded from file)
 GROUP_TALK_ENABLED = True
+GROUP_ID = None   # will be loaded from file or set later
 
-# Conversation memory: user_id -> list of last messages (each is {"role": "user" or "assistant", "content": text})
-# Limited to last 10 messages per user to avoid token overflow.
+# Conversation memory: user_id -> list of last messages
 user_history = defaultdict(list)
 MAX_HISTORY = 10
+
+# ============================================
+# LOAD/SAVE SETTINGS
+# ============================================
+def load_settings():
+    global GROUP_ID, GROUP_TALK_ENABLED
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+                GROUP_ID = data.get("group_id")
+                GROUP_TALK_ENABLED = data.get("group_talk_enabled", True)
+        except:
+            pass
+
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump({"group_id": GROUP_ID, "group_talk_enabled": GROUP_TALK_ENABLED}, f)
+
+load_settings()
 
 # ============================================
 # LOGGING
@@ -63,19 +85,13 @@ dp = Dispatcher()
 # HELPER: Get AI response with memory
 # ============================================
 async def get_ai_response(user_id: int, user_message: str) -> str:
-    # Retrieve history for this user
     history = user_history[user_id]
-    
-    # Prepare messages for DeepSeek
     messages = [
-        {"role": "system", "content": "Ты — дружелюбный, остроумный ИИ-ассистент. Отвечай естественно, как человек в чате. Пиши на русском, кратко и по делу. Если не знаешь — скажи честно."}
+        {"role": "system", "content": "Ты — дружелюбный, остроумный ИИ-ассистент. Отвечай естественно, как человек в чате. Пиши на русском, кратко и по делу."}
     ]
-    # Add last history messages (excluding the current one)
     for msg in history:
         messages.append(msg)
-    # Add current user message
     messages.append({"role": "user", "content": user_message})
-    
     try:
         response = await deepseek_client.chat.completions.create(
             model="deepseek-chat",
@@ -84,10 +100,8 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             max_tokens=800
         )
         answer = response.choices[0].message.content
-        # Update history: add user message and bot response
         user_history[user_id].append({"role": "user", "content": user_message})
         user_history[user_id].append({"role": "assistant", "content": answer})
-        # Trim history to MAX_HISTORY pairs (2 messages per turn)
         if len(user_history[user_id]) > MAX_HISTORY * 2:
             user_history[user_id] = user_history[user_id][-MAX_HISTORY*2:]
         return answer
@@ -102,29 +116,31 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
 async def cmd_start(message: types.Message):
     await message.answer(
         "🤖 Привет! Я ИИ-бот на DeepSeek.\n"
-        "Я могу общаться в группе как человек, а также помогать админу управлять каналом.\n\n"
+        "Я могу общаться в группе, если меня туда добавить.\n"
+        "Администратор может настроить группу командой /setgroup.\n\n"
         "📌 Команды:\n"
         "/start - это сообщение\n"
         "/help - справка\n"
         "/about - информация\n\n"
-        "👑 Админ-команды (только для вас):\n"
+        "👑 Админ-команды:\n"
         "/admin_stats - статистика\n"
+        "/setgroup - установить текущий чат как группу для общения\n"
+        "/toggle_chat - включить/выключить общение в группе\n"
         "/post текст - отправить пост в канал\n"
-        "/pin message_id - закрепить сообщение\n"
+        "/pin id - закрепить сообщение\n"
         "/unpin - открепить\n"
-        "/ban user_id - забанить в группе\n"
-        "/unban user_id - разбанить\n"
-        "/check_sub user_id - проверить подписку\n"
-        "/toggle_chat - включить/выключить общение в группе"
+        "/ban id - забанить в группе\n"
+        "/unban id - разбанить\n"
+        "/check_sub id - проверить подписку"
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    await message.answer("📖 Просто напишите мне текст в личку или в группе — я отвечу. В группе я отвечаю на все сообщения, если режим включён.")
+    await message.answer("📖 Напишите мне текст — я отвечу. В группе я отвечаю, если режим включён (/toggle_chat).")
 
 @dp.message(Command("about"))
 async def cmd_about(message: types.Message):
-    await message.answer("ℹ️ Бот умеет общаться в группе, администрировать канал и модеррировать чат. Версия 4.0")
+    await message.answer("ℹ️ Бот умеет общаться в группе, автоматически запоминает ID группы. Версия 4.1")
 
 # ============================================
 # ADMIN COMMANDS
@@ -135,7 +151,7 @@ def is_admin(user_id: int) -> bool:
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer(f"⛔ Нет прав. Ваш ID: {message.from_user.id}, ожидается {ADMIN_ID}")
+        await message.answer(f"⛔ Нет прав. Ваш ID: {message.from_user.id}")
         return
     bot_info = await message.bot.get_me()
     await message.answer(
@@ -143,10 +159,23 @@ async def admin_stats(message: types.Message):
         f"ID бота: {bot_info.id}\n"
         f"Username: @{bot_info.username}\n"
         f"Канал: {CHANNEL_ID}\n"
-        f"Группа: {GROUP_ID}\n"
+        f"Группа для общения: {GROUP_ID if GROUP_ID else 'не задана'}\n"
         f"Модерация: {'вкл' if ENABLE_MODERATION else 'выкл'}\n"
         f"Общение в группе: {'вкл' if GROUP_TALK_ENABLED else 'выкл'}"
     )
+
+@dp.message(Command("setgroup"))
+async def set_group(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    global GROUP_ID
+    if message.chat.type in ["group", "supergroup"]:
+        GROUP_ID = message.chat.id
+        save_settings()
+        await message.answer(f"✅ Текущий чат установлен как группа для общения. ID: {GROUP_ID}")
+        logger.info(f"Group set to {GROUP_ID} by admin")
+    else:
+        await message.answer("❌ Эта команда работает только в группе или супергруппе.")
 
 @dp.message(Command("toggle_chat"))
 async def toggle_group_chat(message: types.Message):
@@ -154,6 +183,7 @@ async def toggle_group_chat(message: types.Message):
         return
     global GROUP_TALK_ENABLED
     GROUP_TALK_ENABLED = not GROUP_TALK_ENABLED
+    save_settings()
     status = "включён" if GROUP_TALK_ENABLED else "выключен"
     await message.answer(f"🔄 Режим общения в группе {status}.")
 
@@ -200,6 +230,9 @@ async def unpin_message(message: types.Message):
 async def ban_user(message: types.Message):
     if not is_admin(message.from_user.id):
         return
+    if not GROUP_ID:
+        await message.answer("❌ Группа не задана. Используйте /setgroup в группе.")
+        return
     parts = message.text.split()
     if len(parts) < 2:
         await message.answer("Укажите ID пользователя: /ban 123456789")
@@ -214,6 +247,9 @@ async def ban_user(message: types.Message):
 @dp.message(Command("unban"))
 async def unban_user(message: types.Message):
     if not is_admin(message.from_user.id):
+        return
+    if not GROUP_ID:
+        await message.answer("❌ Группа не задана.")
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -243,10 +279,28 @@ async def check_subscription(message: types.Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 # ============================================
-# MODERATION IN GROUP (delete bad messages)
+# AUTO-DETECT GROUP WHEN BOT IS ADDED
+# ============================================
+@dp.my_chat_member()
+async def on_my_chat_member(update: types.ChatMemberUpdated):
+    # When bot is added to a supergroup or group
+    if update.new_chat_member.status in ["member", "administrator"]:
+        chat = update.chat
+        if chat.type in ["group", "supergroup"]:
+            global GROUP_ID
+            if GROUP_ID is None:
+                GROUP_ID = chat.id
+                save_settings()
+                logger.info(f"Automatically set group ID to {GROUP_ID} after being added")
+                await bot.send_message(chat.id, "✅ Бот добавлен в группу. Теперь я буду здесь отвечать на сообщения, если режим включён. Администратор может использовать /toggle_chat для включения/выключения.")
+
+# ============================================
+# MODERATION IN GROUP
 # ============================================
 @dp.message()
 async def moderate_group_messages(message: types.Message):
+    if not GROUP_ID:
+        return
     if message.chat.id != GROUP_ID:
         return
     if not ENABLE_MODERATION:
@@ -266,37 +320,29 @@ async def moderate_group_messages(message: types.Message):
         return
 
 # ============================================
-# AI RESPONSE IN GROUP (like a human)
+# AI RESPONSE IN GROUP
 # ============================================
 @dp.message()
 async def ai_response_group(message: types.Message):
-    # Only respond in the designated group and if group talk enabled
+    if not GROUP_ID:
+        return
     if message.chat.id != GROUP_ID:
         return
     if not GROUP_TALK_ENABLED:
         return
-    # Ignore messages from the bot itself
     if message.from_user.id == bot.id:
         return
-    # Ignore commands
     if message.text and message.text.startswith("/"):
         return
-    # Ignore messages that were deleted or empty
     if not message.text:
         return
-    
-    # Show typing action
+
     await bot.send_chat_action(message.chat.id, "typing")
-    
-    # Get AI response with memory
-    user_id = message.from_user.id
-    answer = await get_ai_response(user_id, message.text)
-    
-    # Reply in the group (mention the user optionally)
+    answer = await get_ai_response(message.from_user.id, message.text)
     await message.reply(answer)
 
 # ============================================
-# AI RESPONSE IN PRIVATE (with memory)
+# AI RESPONSE IN PRIVATE
 # ============================================
 @dp.message()
 async def ai_response_private(message: types.Message):
@@ -306,7 +352,7 @@ async def ai_response_private(message: types.Message):
         return
     if not message.text:
         return
-    
+
     await bot.send_chat_action(message.chat.id, "typing")
     answer = await get_ai_response(message.from_user.id, message.text)
     await message.reply(answer)
@@ -332,7 +378,7 @@ async def run_http_server():
 # MAIN
 # ============================================
 async def main():
-    logger.info("🚀 Запуск бота с режимом общения в группе (как человек)")
+    logger.info("🚀 Запуск бота с автовыбором группы")
     await asyncio.gather(
         dp.start_polling(bot),
         run_http_server()
