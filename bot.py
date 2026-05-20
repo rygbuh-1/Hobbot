@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – FINAL VERSION.
-Responds to ALL text messages in the group (not just commands).
-Fixed SyntaxError: global declaration before usage.
+Telegram AI Bot with DeepSeek – финальная версия.
+Работает в группе на любые текстовые сообщения (кроме команд).
+Эхо-тест прошёл успешно.
 """
 
 import asyncio
@@ -31,7 +31,7 @@ FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 
 PORT = int(os.getenv("PORT", "8080"))
 
-# State (will be loaded from file)
+# State
 GROUP_TALK_ENABLED = True
 GROUP_ID = None
 
@@ -40,7 +40,7 @@ user_history = defaultdict(list)
 MAX_HISTORY = 10
 
 # ============================================
-# LOAD SETTINGS
+# LOAD/SAVE SETTINGS
 # ============================================
 def load_settings():
     global GROUP_ID, GROUP_TALK_ENABLED
@@ -169,7 +169,6 @@ async def test_command(message: types.Message):
     else:
         await message.answer("✅ Тест в личке.")
 
-# Other admin commands (short versions)
 @dp.message(Command("post"))
 async def send_post(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -291,20 +290,25 @@ async def moderate_group_messages(message: types.Message):
         return
 
 # ============================================
-# MAIN GROUP RESPONSE – отвечает на ЛЮБОЕ текстовое сообщение в группе
+# MAIN GROUP RESPONSE – отвечает на ЛЮБОЕ текстовое сообщение в группе (кроме команд)
 # ============================================
 @dp.message()
 async def ai_response_group(message: types.Message):
+    # Проверяем, что это наша группа
     if not GROUP_ID:
         return
     if message.chat.id != GROUP_ID:
         return
+    # Проверяем, включён ли режим общения
     if not GROUP_TALK_ENABLED:
         return
+    # Не отвечаем самому себе
     if message.from_user.id == bot.id:
         return
+    # Игнорируем команды (начинаются с /)
     if message.text and message.text.startswith("/"):
         return
+    # Игнорируем пустые сообщения
     if not message.text:
         return
 
