@@ -25,7 +25,7 @@ CHANNEL_ID = -1003154677228                 # your channel ID
 GROUP_ID = -1002688844179                   # your group ID (for moderation)
 
 # Feature toggles
-REQUIRE_SUBSCRIPTION = True                 # require users to subscribe to channel
+REQUIRE_SUBSCRIPTION = False                 # require users to subscribe to channel
 ENABLE_MODERATION = True                    # auto-delete forbidden words/links in group
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 
@@ -67,7 +67,7 @@ class SubscriptionMiddleware(BaseMiddleware):
             if member.status in ["member", "administrator", "creator"]:
                 return await handler(event, data)
             else:
-                await event.answer("❌ Для использования бота подпишитесь на канал: https://t.me/ваш_канал")
+                await event.answer("❌ Для использования бота подпишитесь на канал: https://t.me/neuroludoman")
                 return
         except Exception as e:
             logger.error(f"Subscription check error: {e}")
