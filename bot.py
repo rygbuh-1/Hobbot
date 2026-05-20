@@ -25,7 +25,7 @@ CHANNEL_ID = -1003154677228                 # your channel ID
 GROUP_ID = -1002688844179                   # your group ID (for moderation)
 
 # Feature toggles
-REQUIRE_SUBSCRIPTION = True                 # require users to subscribe to channel
+REQUIRE_SUBSCRIPTION = Fasle                 # require users to subscribe to channel
 ENABLE_MODERATION = True                    # auto-delete forbidden words/links in group
 FORBIDDEN_WORDS = ["спам", "реклама", "мат"]
 
