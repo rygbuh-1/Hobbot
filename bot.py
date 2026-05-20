@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – Мониторинг канала и автоматическое комментирование постов в группе.
+Telegram AI Bot with DeepSeek – мониторинг канала + сохранение истории в файл.
 """
 
 import asyncio
 import logging
 import os
+import json
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -22,17 +23,19 @@ ADMIN_ID = 682446170
 PORT = int(os.getenv("PORT", "8080"))
 
 # Канал для мониторинга (посты отсюда)
-MONITOR_CHANNEL_ID = -1003154677228   # ID канала, за которым следим
-
-# Куда отправлять комментарии (группа, где бот уже общается)
-TARGET_GROUP_ID = -1002688844179      # группа для комментариев
-
-# Включить/выключить мониторинг
+MONITOR_CHANNEL_ID = -1003154677228
+# Куда отправлять комментарии (группа)
+TARGET_GROUP_ID = -1002688844179
 MONITORING_ENABLED = True
 
-# Память для AI (в группе и для комментариев)
+# Файл для хранения истории разговоров
+HISTORY_FILE = "history.json"
+
+# Максимальное количество хранимых сообщений на пользователя (увеличено до 200)
+MAX_HISTORY = 200
+
+# Память диалога (загружается из файла при старте)
 user_history = defaultdict(list)
-MAX_HISTORY = 10
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -46,7 +49,37 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# AI ОТВЕТ (с памятью)
+# ЗАГРУЗКА / СОХРАНЕНИЕ ИСТОРИИ
+# ============================================
+def load_history():
+    global user_history
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Преобразуем ключи из строк в int
+                user_history = defaultdict(list, {int(k): v for k, v in data.items()})
+                logger.info(f"Загружена история для {len(user_history)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки истории: {e}")
+    else:
+        logger.info("Файл истории не найден, начинаем с пустой")
+
+def save_history():
+    try:
+        # Преобразуем defaultdict в обычный dict с ключами-строками для JSON
+        to_save = {str(k): v for k, v in user_history.items()}
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, ensure_ascii=False, indent=2)
+        logger.debug("История сохранена")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения истории: {e}")
+
+# Загружаем историю при старте
+load_history()
+
+# ============================================
+# AI ОТВЕТ (с памятью, загруженной из файла)
 # ============================================
 async def get_ai_response(user_id: int, user_message: str, system_prompt: str = None) -> str:
     history = user_history[user_id]
@@ -54,6 +87,7 @@ async def get_ai_response(user_id: int, user_message: str, system_prompt: str = 
     messages = [{"role": "system", "content": system_prompt or default_system}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
+    
     try:
         response = await deepseek_client.chat.completions.create(
             model="deepseek-chat",
@@ -62,10 +96,14 @@ async def get_ai_response(user_id: int, user_message: str, system_prompt: str = 
             max_tokens=800
         )
         answer = response.choices[0].message.content
+        # Обновляем историю
         user_history[user_id].append({"role": "user", "content": user_message})
         user_history[user_id].append({"role": "assistant", "content": answer})
+        # Ограничиваем длину
         if len(user_history[user_id]) > MAX_HISTORY * 2:
             user_history[user_id] = user_history[user_id][-MAX_HISTORY*2:]
+        # Сохраняем изменения в файл
+        save_history()
         return answer
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
@@ -76,11 +114,17 @@ async def get_ai_response(user_id: int, user_message: str, system_prompt: str = 
 # ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🤖 Бот активен. Отвечаю в группе, а также мониторю канал и комментирую новые посты.")
+    await message.answer("🤖 Бот активен. Отвечаю в группе, мониторю канал, запоминаю историю разговоров в файле.\n\nКоманды:\n/clear_history - очистить вашу историю\n/admin_stats - статистика")
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer("Команды:\n/toggle_monitor - включить/выключить комментирование постов из канала\n/admin_stats - статус")
+@dp.message(Command("clear_history"))
+async def clear_history(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_history:
+        del user_history[user_id]
+        save_history()
+        await message.answer("✅ Ваша история диалогов очищена.")
+    else:
+        await message.answer("У вас нет сохранённой истории.")
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
@@ -93,7 +137,8 @@ async def admin_stats(message: types.Message):
         f"Бот: @{bot_info.username}\n"
         f"Мониторинг канала: {'ВКЛ' if MONITORING_ENABLED else 'ВЫКЛ'}\n"
         f"Канал: {MONITOR_CHANNEL_ID}\n"
-        f"Группа для комментариев: {TARGET_GROUP_ID}"
+        f"Группа: {TARGET_GROUP_ID}\n"
+        f"Пользователей с историей: {len(user_history)}"
     )
 
 @dp.message(Command("toggle_monitor"))
@@ -111,30 +156,25 @@ async def test_cmd(message: types.Message):
 # ============================================
 # МОНИТОРИНГ НОВЫХ ПОСТОВ В КАНАЛЕ
 # ============================================
-# Bot must be added as admin to the channel to receive updates.
-# We'll listen for channel_post updates.
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
     if not MONITORING_ENABLED:
         return
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
-    # Получаем текст поста (или описание, если это медиа)
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
     logger.info(f"Новый пост в канале: {text[:100]}")
-    # Генерируем комментарий с помощью AI
     system_prompt = "Ты — эксперт, который комментирует посты в канале. Пиши интересно, кратко, иногда с юмором. Отвечай на русском."
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй этот пост: {text}", system_prompt)
-    # Отправляем комментарий в группу
     try:
         await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 Новый пост в канале:\n{text}\n\n💬 Комментарий бота:\n{comment}")
     except Exception as e:
         logger.error(f"Не удалось отправить комментарий в группу: {e}")
 
 # ============================================
-# ОБЫЧНОЕ ОБЩЕНИЕ В ГРУППЕ (как раньше)
+# ОБЫЧНОЕ ОБЩЕНИЕ В ГРУППЕ
 # ============================================
 @dp.message()
 async def group_chat(message: types.Message):
@@ -183,7 +223,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот запущен. Мониторинг канала включён.")
+    logger.info("🚀 Бот запущен. История сохраняется в файл, лимит памяти увеличен до 200 сообщений на пользователя.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
