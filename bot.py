@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – ГАРАНТИРОВАННО РАБОТАЕТ В ЛЮБОЙ ГРУППЕ.
-Отвечает на ЛЮБОЕ текстовое сообщение, кроме команд.
+Telegram AI Bot with DeepSeek – Мониторинг канала и автоматическое комментирование постов в группе.
 """
 
 import asyncio
@@ -22,22 +21,22 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-3ff13ab1a93f4a099554f788b55
 ADMIN_ID = 682446170
 PORT = int(os.getenv("PORT", "8080"))
 
-# Режим общения в группах (можно включить/выключить командой /toggle_chat)
-GROUP_TALK_ENABLED = True
+# Канал для мониторинга (посты отсюда)
+MONITOR_CHANNEL_ID = -1003154677228   # ID канала, за которым следим
 
-# Память диалога (последние 10 сообщений на пользователя)
+# Куда отправлять комментарии (группа, где бот уже общается)
+TARGET_GROUP_ID = -1002688844179      # группа для комментариев
+
+# Включить/выключить мониторинг
+MONITORING_ENABLED = True
+
+# Память для AI (в группе и для комментариев)
 user_history = defaultdict(list)
 MAX_HISTORY = 10
 
-# ============================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ
-# ============================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============================================
-# DEEPSEEK CLIENT
-# ============================================
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1"
@@ -47,13 +46,12 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # ============================================
-# ФУНКЦИЯ ОТВЕТА AI
+# AI ОТВЕТ (с памятью)
 # ============================================
-async def get_ai_response(user_id: int, user_message: str) -> str:
+async def get_ai_response(user_id: int, user_message: str, system_prompt: str = None) -> str:
     history = user_history[user_id]
-    messages = [
-        {"role": "system", "content": "Ты — дружелюбный, остроумный ИИ-ассистент. Отвечай естественно, как человек в чате. Пиши на русском, кратко и по делу."}
-    ]
+    default_system = "Ты — дружелюбный, остроумный ИИ-ассистент. Отвечай естественно, как человек в чате. Пиши на русском, кратко и по делу."
+    messages = [{"role": "system", "content": system_prompt or default_system}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
     try:
@@ -74,86 +72,88 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         return f"⚠️ Ошибка DeepSeek: {str(e)}"
 
 # ============================================
-# ОБЩИЕ КОМАНДЫ
+# КОМАНДЫ
 # ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🤖 Бот активен. В группах отвечаю на все сообщения (если режим не выключен).")
+    await message.answer("🤖 Бот активен. Отвечаю в группе, а также мониторю канал и комментирую новые посты.")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    await message.answer("Просто напишите текст — я отвечу. В группах отвечаю тоже.")
+    await message.answer("Команды:\n/toggle_monitor - включить/выключить комментирование постов из канала\n/admin_stats - статус")
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer(f"Нет прав. Ваш ID: {message.from_user.id}")
+        await message.answer(f"Нет прав")
         return
     bot_info = await message.bot.get_me()
     await message.answer(
-        f"✅ Статус администратора\n"
+        f"✅ Статус\n"
         f"Бот: @{bot_info.username}\n"
-        f"Режим общения в группах: {'ВКЛ' if GROUP_TALK_ENABLED else 'ВЫКЛ'}"
+        f"Мониторинг канала: {'ВКЛ' if MONITORING_ENABLED else 'ВЫКЛ'}\n"
+        f"Канал: {MONITOR_CHANNEL_ID}\n"
+        f"Группа для комментариев: {TARGET_GROUP_ID}"
     )
 
-@dp.message(Command("toggle_chat"))
-async def toggle_chat(message: types.Message):
+@dp.message(Command("toggle_monitor"))
+async def toggle_monitor(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    global GROUP_TALK_ENABLED
-    GROUP_TALK_ENABLED = not GROUP_TALK_ENABLED
-    status = "включён" if GROUP_TALK_ENABLED else "выключен"
-    await message.answer(f"🔄 Режим общения в группах {status}.")
+    global MONITORING_ENABLED
+    MONITORING_ENABLED = not MONITORING_ENABLED
+    await message.answer(f"Мониторинг канала {'включён' if MONITORING_ENABLED else 'выключен'}.")
 
 @dp.message(Command("test"))
 async def test_cmd(message: types.Message):
-    await message.reply("✅ Бот работает и видит это сообщение!")
+    await message.reply("✅ Бот работает")
 
 # ============================================
-# ОТВЕТЫ В ГРУППЕ (максимально простой обработчик)
+# МОНИТОРИНГ НОВЫХ ПОСТОВ В КАНАЛЕ
+# ============================================
+# Bot must be added as admin to the channel to receive updates.
+# We'll listen for channel_post updates.
+@dp.channel_post()
+async def handle_channel_post(post: types.Message):
+    if not MONITORING_ENABLED:
+        return
+    if post.chat.id != MONITOR_CHANNEL_ID:
+        return
+    # Получаем текст поста (или описание, если это медиа)
+    text = post.text or post.caption or ""
+    if not text:
+        text = "[Пост без текста]"
+    logger.info(f"Новый пост в канале: {text[:100]}")
+    # Генерируем комментарий с помощью AI
+    system_prompt = "Ты — эксперт, который комментирует посты в канале. Пиши интересно, кратко, иногда с юмором. Отвечай на русском."
+    comment = await get_ai_response(ADMIN_ID, f"Прокомментируй этот пост: {text}", system_prompt)
+    # Отправляем комментарий в группу
+    try:
+        await bot.send_message(chat_id=TARGET_GROUP_ID, text=f"📢 Новый пост в канале:\n{text}\n\n💬 Комментарий бота:\n{comment}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить комментарий в группу: {e}")
+
+# ============================================
+# ОБЫЧНОЕ ОБЩЕНИЕ В ГРУППЕ (как раньше)
 # ============================================
 @dp.message()
-async def group_response(message: types.Message):
-    # Логируем ВСЕ входящие сообщения (для отладки)
-    logger.info(f"Получено сообщение: чат={message.chat.id} тип={message.chat.type} текст='{message.text}' от={message.from_user.id}")
-    
-    # Отвечаем только в группах и супергруппах
+async def group_chat(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
-        logger.info("Не группа, пропускаем")
         return
-    
-    # Не отвечаем на команды
-    if message.text and message.text.startswith("/"):
-        logger.info("Команда, пропускаем")
+    if message.chat.id != TARGET_GROUP_ID:
         return
-    
-    # Не отвечаем самому себе
     if message.from_user.id == bot.id:
-        logger.info("Сообщение от бота, пропускаем")
         return
-    
-    # Если режим общения выключен
-    if not GROUP_TALK_ENABLED:
-        logger.info("Режим общения выключен")
+    if message.text and message.text.startswith("/"):
         return
-    
-    # Пустое сообщение
-    if not message.text:
-        logger.info("Пустое сообщение")
-        return
-    
-    logger.info(f"✅ Отвечаем в группе на: {message.text[:100]}")
+
+    user_text = message.text or "Сообщение без текста"
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text)
-    try:
-        await message.reply(answer)
-        logger.info("Ответ отправлен")
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
-        await message.answer("⚠️ Не удалось отправить ответ")
+    answer = await get_ai_response(message.from_user.id, user_text)
+    await message.reply(answer)
 
 # ============================================
-# ОТВЕТЫ В ЛИЧНЫХ СООБЩЕНИЯХ
+# ОТВЕТЫ В ЛИЧКЕ
 # ============================================
 @dp.message()
 async def private_response(message: types.Message):
@@ -161,14 +161,13 @@ async def private_response(message: types.Message):
         return
     if message.text and message.text.startswith("/"):
         return
-    if not message.text:
-        return
+    user_text = message.text or "Сообщение"
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text)
+    answer = await get_ai_response(message.from_user.id, user_text)
     await message.reply(answer)
 
 # ============================================
-# HEALTH CHECK СЕРВЕР
+# HEALTH CHECK
 # ============================================
 async def health_check(request):
     return web.Response(text="OK")
@@ -181,14 +180,10 @@ async def run_http():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"✅ Health check сервер запущен на порту {PORT}")
     await asyncio.Event().wait()
 
-# ============================================
-# ЗАПУСК
-# ============================================
 async def main():
-    logger.info("🚀 Бот запущен. Режим: отвечаю на ВСЕ сообщения в группах (кроме команд)")
+    logger.info("🚀 Бот запущен. Мониторинг канала включён.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
