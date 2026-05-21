@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot – ФИНАЛЬНАЯ ВЕРСИЯ С ЖЁСТКОЙ ДЕДУПЛИКАЦИЕЙ.
-Исправлен синтаксис f-string.
+Telegram AI Bot – ВЕРСИЯ 2.0.0 (жёсткая дедупликация по post_id).
+Команда /version показывает версию бота.
 """
 
 import asyncio
@@ -9,7 +9,6 @@ import logging
 import os
 import json
 import time
-import hashlib
 import fcntl
 import aiohttp
 from collections import defaultdict
@@ -18,6 +17,8 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
+
+VERSION = "2.0.0"
 
 # ============================================
 # КЛЮЧИ
@@ -41,7 +42,7 @@ PROCESSED_FILE = "processed_posts.json"
 LOCK_FILE = "processing.lock"
 
 MAX_HISTORY = 50
-DUPLICATE_TIMEOUT = 3600  # 1 час
+DUPLICATE_TIMEOUT = 86400  # 24 часа
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -52,12 +53,12 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Глобальные хранилища (загружаются из файлов)
+# Глобальные хранилища
 user_history = defaultdict(list)
-processed_hashes = {}
+processed_posts = {}  # {post_id: timestamp}
 
 # ============================================
-# ФУНКЦИИ РАБОТЫ С ФАЙЛОВЫМИ БЛОКИРОВКАМИ
+# ФАЙЛОВЫЕ БЛОКИРОВКИ
 # ============================================
 def acquire_lock():
     lock_fd = open(LOCK_FILE, 'w')
@@ -69,25 +70,26 @@ def release_lock(lock_fd):
     lock_fd.close()
 
 # ============================================
-# ЗАГРУЗКА/СОХРАНЕНИЕ ДАННЫХ С БЛОКИРОВКОЙ
+# ЗАГРУЗКА/СОХРАНЕНИЕ
 # ============================================
 def load_processed():
-    global processed_hashes
+    global processed_posts
     if os.path.exists(PROCESSED_FILE):
         try:
             with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                processed_hashes = data
-                logger.info(f"Загружено {len(processed_hashes)} обработанных постов")
+                processed_posts = {int(k): v for k, v in data.items()}
+                logger.info(f"Загружено {len(processed_posts)} обработанных post_id")
         except Exception as e:
-            logger.error(f"Ошибка загрузки processed_hashes: {e}")
+            logger.error(f"Ошибка загрузки processed_posts: {e}")
 
 def save_processed():
     try:
+        to_save = {str(k): v for k, v in processed_posts.items()}
         with open(PROCESSED_FILE, "w", encoding="utf-8") as f:
-            json.dump(processed_hashes, f, ensure_ascii=False, indent=2)
+            json.dump(to_save, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Ошибка сохранения processed_hashes: {e}")
+        logger.error(f"Ошибка сохранения processed_posts: {e}")
 
 def load_history():
     global user_history
@@ -201,9 +203,13 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
 # ============================================
 # КОМАНДЫ
 # ============================================
+@dp.message(Command("version"))
+async def cmd_version(message: types.Message):
+    await message.answer(f"🤖 Версия бота: {VERSION}")
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await safe_send(message.chat.id, "🤖 Эксперт по ставкам. Напиши матч – проанализирую.\n/clear_history, /admin_stats, /toggle_monitor")
+    await safe_send(message.chat.id, f"🤖 Эксперт по ставкам. Версия {VERSION}\nНапиши матч – проанализирую.\n/clear_history, /admin_stats, /toggle_monitor, /version")
 
 @dp.message(Command("clear_history"))
 async def clear_history(message: types.Message):
@@ -220,7 +226,7 @@ async def admin_stats(message: types.Message):
         await message.answer("Нет прав.")
         return
     bot_info = await message.bot.get_me()
-    await message.answer(f"**Статус**\n@{bot_info.username}\nМониторинг: {'✅' if MONITORING_ENABLED else '❌'}\nПользователей: {len(user_history)}\nОбработано постов: {len(processed_hashes)}", parse_mode="Markdown")
+    await message.answer(f"**Статус**\nВерсия: {VERSION}\n@{bot_info.username}\nМониторинг: {'✅' if MONITORING_ENABLED else '❌'}\nПользователей: {len(user_history)}\nОбработано post_id: {len(processed_posts)}", parse_mode="Markdown")
 
 @dp.message(Command("toggle_monitor"))
 async def toggle_monitor(message: types.Message):
@@ -232,44 +238,46 @@ async def toggle_monitor(message: types.Message):
 
 @dp.message(Command("test"))
 async def test_cmd(message: types.Message):
-    await message.reply("✅ Бот активен")
+    await message.reply(f"✅ Бот активен (версия {VERSION})")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА С ЖЁСТКОЙ ДЕДУПЛИКАЦИЕЙ
+# МОНИТОРИНГ КАНАЛА (ДЕДУПЛИКАЦИЯ ПО POST_ID)
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
-    global processed_hashes
+    global processed_posts
     if not MONITORING_ENABLED:
         return
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
 
-    text = post.text or post.caption or ""
-    if not text:
-        text = "[Пост без текста]"
-    unique_key = hashlib.md5(f"{post.chat.id}:{post.message_id}:{text}".encode('utf-8')).hexdigest()
+    post_id = post.message_id
     now = time.time()
 
+    # Блокировка для исключения параллельной обработки
     lock_fd = acquire_lock()
     try:
-        if unique_key in processed_hashes:
-            last_time = processed_hashes[unique_key]
+        if post_id in processed_posts:
+            last_time = processed_posts[post_id]
             if now - last_time < DUPLICATE_TIMEOUT:
-                logger.info(f"Пост {post.message_id} (хеш {unique_key[:8]}) уже обработан, пропускаем")
+                logger.info(f"Пост {post_id} уже обработан {now-last_time:.0f} сек назад, пропускаем")
                 return
-        processed_hashes[unique_key] = now
+        processed_posts[post_id] = now
         save_processed()
-        to_delete = [k for k, ts in processed_hashes.items() if now - ts > 86400]
-        for k in to_delete:
-            del processed_hashes[k]
+        # Очистка старых записей (старше 24 часов)
+        to_delete = [pid for pid, ts in processed_posts.items() if now - ts > 86400]
+        for pid in to_delete:
+            del processed_posts[pid]
         if to_delete:
             save_processed()
-            logger.info(f"Очищено {len(to_delete)} старых хешей")
+            logger.info(f"Очищено {len(to_delete)} старых post_id")
     finally:
         release_lock(lock_fd)
 
-    logger.info(f"Обрабатываю пост {post.message_id}: {text[:100]}")
+    text = post.text or post.caption or ""
+    if not text:
+        text = "[Пост без текста]"
+    logger.info(f"Обрабатываю пост {post_id}: {text[:100]}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
     await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
 
@@ -308,7 +316,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 ФИНАЛЬНЫЙ ЗАПУСК с жёсткой дедупликацией (исправлен синтаксис f-string)")
+    logger.info(f"🚀 Запуск бота версии {VERSION} с дедупликацией по post_id")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
