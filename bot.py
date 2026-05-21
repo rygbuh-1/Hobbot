@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot – финальная версия с дедупликацией по хешу текста поста.
-Исправлена ошибка NameError: name 'dp' is not defined.
+Telegram AI Bot – ФИНАЛЬНАЯ ВЕРСИЯ С ЖЁСТКОЙ ДЕДУПЛИКАЦИЕЙ.
+Используется блокировка на уровне файла + проверка уникального ключа.
 """
 
 import asyncio
@@ -10,6 +10,7 @@ import os
 import json
 import time
 import hashlib
+import fcntl
 import aiohttp
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
@@ -37,6 +38,8 @@ MONITORING_ENABLED = True
 
 HISTORY_FILE = "history.json"
 PROCESSED_FILE = "processed_posts.json"
+LOCK_FILE = "processing.lock"
+
 MAX_HISTORY = 50
 DUPLICATE_TIMEOUT = 3600  # 1 час
 
@@ -44,17 +47,30 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# ИНИЦИАЛИЗАЦИЯ БОТА И ДИСПЕТЧЕРА (ДО ДЕКОРАТОРОВ)
+# БОТ И ДИСПЕТЧЕР
 # ============================================
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Глобальные хранилища
+# Глобальные хранилища (загружаются из файлов)
 user_history = defaultdict(list)
-processed_hashes = {}
+processed_hashes = {}  # key: hash -> timestamp
 
 # ============================================
-# ЗАГРУЗКА/СОХРАНЕНИЕ ОБРАБОТАННЫХ ПОСТОВ
+# ФУНКЦИИ РАБОТЫ С ФАЙЛОВЫМИ БЛОКИРОВКАМИ
+# ============================================
+def acquire_lock():
+    """Получаем эксклюзивную блокировку на файл, чтобы предотвратить параллельную обработку дублей."""
+    lock_fd = open(LOCK_FILE, 'w')
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    return lock_fd
+
+def release_lock(lock_fd):
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    lock_fd.close()
+
+# ============================================
+# ЗАГРУЗКА/СОХРАНЕНИЕ ДАННЫХ С БЛОКИРОВКОЙ
 # ============================================
 def load_processed():
     global processed_hashes
@@ -74,10 +90,30 @@ def save_processed():
     except Exception as e:
         logger.error(f"Ошибка сохранения processed_hashes: {e}")
 
+def load_history():
+    global user_history
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                user_history = defaultdict(list, {int(k): v for k, v in data.items()})
+                logger.info(f"Загружена история для {len(user_history)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки истории: {e}")
+
+def save_history():
+    try:
+        to_save = {str(k): v for k, v in user_history.items()}
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения истории: {e}")
+
 load_processed()
+load_history()
 
 # ============================================
-# ФУНКЦИЯ БЕЗОПАСНОЙ ОТПРАВКИ
+# БЕЗОПАСНАЯ ОТПРАВКА
 # ============================================
 async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
     if not text:
@@ -97,7 +133,7 @@ async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
         await asyncio.sleep(0.5)
 
 # ============================================
-# ПОИСК ЧЕРЕЗ SERPAPI
+# ПОИСК
 # ============================================
 async def search_web(query: str, num_results: int = 3) -> str:
     params = {
@@ -127,30 +163,6 @@ async def search_web(query: str, num_results: int = 3) -> str:
         return "⚠️ Ошибка поиска."
 
 EXPERT_PROMPT = """Ты – эксперт по ставкам на спорт. Анализируй по методологии (кадры, тактика, мотивация, усталость, верификация). Отвечай кратко – до 2500 символов. Указывай ссылки на источники. Без воды и повторов."""
-
-# ============================================
-# ИСТОРИЯ ДИАЛОГОВ
-# ============================================
-def load_history():
-    global user_history
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                user_history = defaultdict(list, {int(k): v for k, v in data.items()})
-                logger.info(f"Загружена история для {len(user_history)} пользователей")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки истории: {e}")
-
-def save_history():
-    try:
-        to_save = {str(k): v for k, v in user_history.items()}
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(to_save, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Ошибка сохранения истории: {e}")
-
-load_history()
 
 # ============================================
 # AI ОТВЕТ
@@ -224,7 +236,7 @@ async def test_cmd(message: types.Message):
     await message.reply("✅ Бот активен")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (ДЕДУПЛИКАЦИЯ ПО ХЕШУ ТЕКСТА)
+# МОНИТОРИНГ КАНАЛА С ЖЁСТКОЙ ДЕДУПЛИКАЦИЕЙ
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -234,28 +246,37 @@ async def handle_channel_post(post: types.Message):
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
 
+    # Генерируем уникальный ключ для поста: channel_id + post_id + текст
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    
-    text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+    unique_key = hashlib.md5(f"{post.chat.id}:{post.message_id}:{text}".encode('utf-8')).hexdigest()
     now = time.time()
 
-    if text_hash in processed_hashes:
-        last_time = processed_hashes[text_hash]
-        if now - last_time < DUPLICATE_TIMEOUT:
-            logger.info(f"Пост с хешем {text_hash[:8]} уже обработан {now-last_time:.0f} сек назад, пропускаем")
-            return
-    processed_hashes[text_hash] = now
-    # Очистка старых хешей (старше 24 часов)
-    to_delete = [h for h, ts in processed_hashes.items() if now - ts > 86400]
-    for h in to_delete:
-        del processed_hashes[h]
-    if to_delete:
-        logger.info(f"Очищено {len(to_delete)} старых хешей")
-    save_processed()
+    # БЛОКИРОВКА: используем файловую блокировку для исключения параллельных вызовов
+    lock_fd = acquire_lock()
+    try:
+        # Проверка в оперативной памяти
+        if unique_key in processed_hashes:
+            last_time = processed_hashes[unique_key]
+            if now - last_time < DUPLICATE_TIMEOUT:
+                logger.info(f"Пост {post.message_id} (хеш {unique_key[:8]) уже обработан, пропускаем")
+                return
+        # Отмечаем как обработанный
+        processed_hashes[unique_key] = now
+        # Сохраняем на диск
+        save_processed()
+        # Очистка старых записей
+        to_delete = [k for k, ts in processed_hashes.items() if now - ts > 86400]
+        for k in to_delete:
+            del processed_hashes[k]
+        if to_delete:
+            save_processed()
+            logger.info(f"Очищено {len(to_delete)} старых хешей")
+    finally:
+        release_lock(lock_fd)
 
-    logger.info(f"Обрабатываю пост: {text[:100]}")
+    logger.info(f"Обрабатываю пост {post.message_id}: {text[:100]}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
     await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
 
@@ -294,7 +315,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Запуск бота с дедупликацией по хешу текста поста")
+    logger.info("🚀 ФИНАЛЬНЫЙ ЗАПУСК с жёсткой дедупликацией (файловая блокировка + уникальный ключ)")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
