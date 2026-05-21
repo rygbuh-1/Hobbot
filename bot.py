@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт с авто-поиском (SerpAPI).
-Исправлено: дублирование ответов на посты канала (добавлен set() для обработанных post_id).
+Исправлены ошибки openai/httpx.
 """
 
 import asyncio
@@ -36,7 +36,6 @@ MONITORING_ENABLED = True
 HISTORY_FILE = "history.json"
 MAX_HISTORY = 50
 
-# Для предотвращения дублей: храним ID последних обработанных постов
 processed_posts = set()
 PROCESSED_POSTS_MAX = 100
 
@@ -45,9 +44,11 @@ logger = logging.getLogger(__name__)
 
 user_history = defaultdict(list)
 
+# Инициализация DeepSeek без дополнительных параметров
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com/v1"
+    base_url="https://api.deepseek.com/v1",
+    timeout=60.0
 )
 
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
@@ -74,7 +75,7 @@ async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
         await asyncio.sleep(0.5)
 
 # ============================================
-# ПОИСК
+# ПОИСК ЧЕРЕЗ SERPAPI
 # ============================================
 async def search_web(query: str, num_results: int = 3) -> str:
     params = {
@@ -177,7 +178,7 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         return answer
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
-        return f"⚠️ Ошибка: {str(e)}"
+        return f"⚠️ Ошибка DeepSeek: {str(e)}"
 
 # ============================================
 # КОМАНДЫ
@@ -224,7 +225,7 @@ async def test_cmd(message: types.Message):
     await message.reply("✅ Бот активен")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (с защитой от дублей)
+# МОНИТОРИНГ КАНАЛА
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -233,13 +234,11 @@ async def handle_channel_post(post: types.Message):
         return
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
-    # Защита от дублей: если пост уже обработан – пропускаем
     post_id = post.message_id
     if post_id in processed_posts:
-        logger.info(f"Пост {post_id} уже обработан, пропускаем")
+        logger.info(f"Пост {post_id} уже обработан")
         return
     processed_posts.add(post_id)
-    # Ограничиваем размер множества
     if len(processed_posts) > PROCESSED_POSTS_MAX:
         processed_posts = set(list(processed_posts)[-PROCESSED_POSTS_MAX:])
 
@@ -297,7 +296,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот запущен. Защита от дублей постов включена.")
+    logger.info("🚀 Бот с исправленными зависимостями запущен.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
