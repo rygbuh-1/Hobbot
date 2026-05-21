@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot – финальная версия с дедупликацией по хешу текста поста.
+Исправлена ошибка NameError: name 'dp' is not defined.
 """
 
 import asyncio
@@ -35,15 +36,22 @@ TARGET_GROUP_ID = -1002688844179
 MONITORING_ENABLED = True
 
 HISTORY_FILE = "history.json"
-PROCESSED_FILE = "processed_posts.json"  # храним хеши обработанных постов
+PROCESSED_FILE = "processed_posts.json"
 MAX_HISTORY = 50
-DUPLICATE_TIMEOUT = 3600  # 1 час – не обрабатывать повторно тот же текст
+DUPLICATE_TIMEOUT = 3600  # 1 час
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ============================================
+# ИНИЦИАЛИЗАЦИЯ БОТА И ДИСПЕТЧЕРА (ДО ДЕКОРАТОРОВ)
+# ============================================
+bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+# Глобальные хранилища
 user_history = defaultdict(list)
-processed_hashes = {}  # {hash: timestamp}
+processed_hashes = {}
 
 # ============================================
 # ЗАГРУЗКА/СОХРАНЕНИЕ ОБРАБОТАННЫХ ПОСТОВ
@@ -69,7 +77,7 @@ def save_processed():
 load_processed()
 
 # ============================================
-# ФУНКЦИИ
+# ФУНКЦИЯ БЕЗОПАСНОЙ ОТПРАВКИ
 # ============================================
 async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
     if not text:
@@ -88,6 +96,9 @@ async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
             await bot.send_message(chat_id, part)
         await asyncio.sleep(0.5)
 
+# ============================================
+# ПОИСК ЧЕРЕЗ SERPAPI
+# ============================================
 async def search_web(query: str, num_results: int = 3) -> str:
     params = {
         "q": query,
@@ -117,6 +128,9 @@ async def search_web(query: str, num_results: int = 3) -> str:
 
 EXPERT_PROMPT = """Ты – эксперт по ставкам на спорт. Анализируй по методологии (кадры, тактика, мотивация, усталость, верификация). Отвечай кратко – до 2500 символов. Указывай ссылки на источники. Без воды и повторов."""
 
+# ============================================
+# ИСТОРИЯ ДИАЛОГОВ
+# ============================================
 def load_history():
     global user_history
     if os.path.exists(HISTORY_FILE):
@@ -137,6 +151,15 @@ def save_history():
         logger.error(f"Ошибка сохранения истории: {e}")
 
 load_history()
+
+# ============================================
+# AI ОТВЕТ
+# ============================================
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1",
+    timeout=60.0
+)
 
 async def get_ai_response(user_id: int, user_message: str) -> str:
     search_query = user_message + " травмы состав прогноз"
@@ -215,19 +238,16 @@ async def handle_channel_post(post: types.Message):
     if not text:
         text = "[Пост без текста]"
     
-    # Вычисляем хеш текста
     text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
     now = time.time()
 
-    # Проверяем, не обрабатывали ли уже такой текст
     if text_hash in processed_hashes:
         last_time = processed_hashes[text_hash]
         if now - last_time < DUPLICATE_TIMEOUT:
             logger.info(f"Пост с хешем {text_hash[:8]} уже обработан {now-last_time:.0f} сек назад, пропускаем")
             return
-    # Обновляем запись
     processed_hashes[text_hash] = now
-    # Очищаем старые хеши (старше 24 часов)
+    # Очистка старых хешей (старше 24 часов)
     to_delete = [h for h, ts in processed_hashes.items() if now - ts > 86400]
     for h in to_delete:
         del processed_hashes[h]
