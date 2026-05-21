@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт.
-Усиленная защита от дублирования ответов с помощью блокировок.
+Telegram AI Bot – финальная версия с жёсткой дедупликацией по post_id.
+DUPLICATE_TIMEOUT увеличен до 60 секунд.
 """
 
 import asyncio
@@ -40,7 +40,7 @@ MAX_HISTORY = 50
 # Защита от дублей
 processed_posts = {}
 processing_lock = asyncio.Lock()
-DUPLICATE_TIMEOUT = 10  # секунд, в течение которых повторный пост не обрабатывается
+DUPLICATE_TIMEOUT = 60  # 60 секунд – надёжно
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -91,8 +91,8 @@ async def search_web(query: str, num_results: int = 3) -> str:
                 data = await resp.json()
                 results = data.get("organic_results", [])
                 if not results:
-                    return "❌ Не удалось найти информацию."
-                answer = "🔍 **Результаты поиска:**\n\n"
+                    return "❌ Информация не найдена."
+                answer = "🔍 **Источники:**\n\n"
                 for i, res in enumerate(results[:num_results], 1):
                     title = res.get("title", "Без заголовка")
                     link = res.get("link", "#")
@@ -101,16 +101,10 @@ async def search_web(query: str, num_results: int = 3) -> str:
                 return answer
     except Exception as e:
         logger.error(f"Ошибка SerpAPI: {e}")
-        return "⚠️ Ошибка при поиске."
+        return "⚠️ Ошибка поиска."
 
-EXPERT_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
-Анализируй матчи по методологии (кадры, тактика, мотивация, усталость, верификация).
-ОТВЕЧАЙ КРАТКО: максимум 2500 символов. Всегда указывай источники (ссылки из поиска).
-Будь объективен, давай чёткие выводы."""
+EXPERT_PROMPT = """Ты – эксперт по ставкам на спорт. Анализируй по методологии (кадры, тактика, мотивация, усталость, верификация). Отвечай кратко – до 2500 символов. Указывай ссылки на источники. Без воды и повторов."""
 
-# ============================================
-# ИСТОРИЯ
-# ============================================
 def load_history():
     global user_history
     if os.path.exists(HISTORY_FILE):
@@ -135,8 +129,7 @@ load_history()
 async def get_ai_response(user_id: int, user_message: str) -> str:
     search_query = user_message + " травмы состав прогноз"
     search_results = await search_web(search_query, num_results=3)
-    context = f"Пользователь спрашивает: {user_message}\n\n{search_results}\n\n"
-    context += "Дай краткий анализ по методологии (до 2500 символов)."
+    context = f"Запрос: {user_message}\n\n{search_results}\n\nДай краткий анализ по методологии (до 2500 символов)."
     history = user_history[user_id][-20:]
     messages = [{"role": "system", "content": EXPERT_PROMPT}]
     messages.extend(history)
@@ -146,7 +139,7 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             model="deepseek-chat",
             messages=messages,
             temperature=0.7,
-            max_tokens=1200
+            max_tokens=800
         )
         answer = response.choices[0].message.content
         user_history[user_id].append({"role": "user", "content": user_message})
@@ -157,17 +150,14 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         return answer
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
-        return f"⚠️ Ошибка DeepSeek: {str(e)}"
+        return f"⚠️ Ошибка: {str(e)}"
 
 # ============================================
 # КОМАНДЫ
 # ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await safe_send(message.chat.id,
-        "🤖 **Эксперт по ставкам**\n"
-        "Напиши матч – я проанализирую.\n"
-        "Команды: /clear_history, /admin_stats, /toggle_monitor")
+    await safe_send(message.chat.id, "🤖 Эксперт по ставкам. Напиши матч – проанализирую.\n/clear_history, /admin_stats, /toggle_monitor")
 
 @dp.message(Command("clear_history"))
 async def clear_history(message: types.Message):
@@ -175,6 +165,8 @@ async def clear_history(message: types.Message):
         del user_history[message.from_user.id]
         save_history()
         await message.answer("✅ История очищена.")
+    else:
+        await message.answer("Нет истории.")
 
 @dp.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
@@ -182,12 +174,7 @@ async def admin_stats(message: types.Message):
         await message.answer("Нет прав.")
         return
     bot_info = await message.bot.get_me()
-    await message.answer(
-        f"**Статус**\n@{bot_info.username}\n"
-        f"Мониторинг: {'✅' if MONITORING_ENABLED else '❌'}\n"
-        f"Пользователей: {len(user_history)}",
-        parse_mode="Markdown"
-    )
+    await message.answer(f"**Статус**\n@{bot_info.username}\nМониторинг: {'✅' if MONITORING_ENABLED else '❌'}\nПользователей: {len(user_history)}", parse_mode="Markdown")
 
 @dp.message(Command("toggle_monitor"))
 async def toggle_monitor(message: types.Message):
@@ -202,7 +189,7 @@ async def test_cmd(message: types.Message):
     await message.reply("✅ Бот активен")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (С БЛОКИРОВКОЙ ОДНОВРЕМЕННЫХ ВЫЗОВОВ)
+# МОНИТОРИНГ КАНАЛА (СТРОГАЯ ДЕДУПЛИКАЦИЯ)
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -215,58 +202,46 @@ async def handle_channel_post(post: types.Message):
     post_id = post.message_id
     now = time.time()
 
-    # Блокируем одновременную обработку одного и того же поста
     async with processing_lock:
+        # Проверка по таймстампу
         if post_id in processed_posts:
-            last_time = processed_posts[post_id]
-            if now - last_time < DUPLICATE_TIMEOUT:
-                logger.info(f"Пост {post_id} уже обработан {now-last_time:.1f} сек назад, пропускаем")
+            last = processed_posts[post_id]
+            if now - last < DUPLICATE_TIMEOUT:
+                logger.info(f"Пост {post_id} пропущен (обработан {now-last:.1f} сек назад)")
                 return
-        # Отмечаем, что начали обработку
+        # Отмечаем как обработанный
         processed_posts[post_id] = now
-        # Очищаем старые записи
+        # Чистка старых
         if len(processed_posts) > 100:
-            to_delete = [pid for pid, ts in processed_posts.items() if now - ts > 300]
-            for pid in to_delete:
+            old = [pid for pid, ts in processed_posts.items() if now - ts > 300]
+            for pid in old:
                 del processed_posts[pid]
-            logger.info(f"Очищено {len(to_delete)} старых записей")
+            logger.info(f"Очищено {len(old)} старых постов")
 
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    logger.info(f"Обработка поста {post_id}: {text[:100]}")
+    logger.info(f"Обрабатываю пост {post_id}: {text[:100]}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
     await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
 
 # ============================================
-# ОБЩЕНИЕ В ГРУППЕ
+# ОБЩЕНИЕ В ГРУППЕ И ЛИЧКЕ
 # ============================================
 @dp.message()
 async def group_chat(message: types.Message):
-    if message.chat.type not in ["group", "supergroup"]:
-        return
-    if message.chat.id != TARGET_GROUP_ID:
-        return
-    if message.from_user.id == bot.id:
-        return
-    if message.text and message.text.startswith("/"):
-        return
-    await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text)
-    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
+    if message.chat.type in ["group", "supergroup"] and message.chat.id == TARGET_GROUP_ID:
+        if message.from_user.id != bot.id and not (message.text and message.text.startswith("/")):
+            await bot.send_chat_action(message.chat.id, "typing")
+            answer = await get_ai_response(message.from_user.id, message.text)
+            await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
 
-# ============================================
-# ЛИЧКА
-# ============================================
 @dp.message()
 async def private_response(message: types.Message):
-    if message.chat.type != "private":
-        return
-    if message.text and message.text.startswith("/"):
-        return
-    await bot.send_chat_action(message.chat.id, "typing")
-    answer = await get_ai_response(message.from_user.id, message.text)
-    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
+    if message.chat.type == "private" and not (message.text and message.text.startswith("/")):
+        await bot.send_chat_action(message.chat.id, "typing")
+        answer = await get_ai_response(message.from_user.id, message.text)
+        await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
 
 # ============================================
 # HEALTH CHECK
@@ -285,7 +260,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот с блокировкой дублей запущен.")
+    logger.info("🚀 Запуск бота с жёсткой дедупликацией (таймаут 60 сек)")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
