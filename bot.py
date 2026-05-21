@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot – ВЕРСИЯ 2.0.0 (жёсткая дедупликация по post_id).
-Команда /version показывает версию бота.
+Telegram AI Bot – ВЕРСИЯ 2.0.1 (расширенное логирование для отладки дублей).
 """
 
 import asyncio
@@ -18,7 +17,7 @@ from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # ============================================
 # КЛЮЧИ
@@ -42,7 +41,7 @@ PROCESSED_FILE = "processed_posts.json"
 LOCK_FILE = "processing.lock"
 
 MAX_HISTORY = 50
-DUPLICATE_TIMEOUT = 86400  # 24 часа
+DUPLICATE_TIMEOUT = 10  # 10 секунд на повторную обработку того же post_id (для теста)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -124,10 +123,15 @@ async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
             await bot.send_message(chat_id, text, reply_to_message_id=reply_to_message_id)
         else:
             await bot.send_message(chat_id, text)
+        logger.info(f"Отправлено одно сообщение (длина {len(text)})")
         return
+    # Если текст длинный, разбиваем
+    parts = []
     for i in range(0, len(text), 4000):
-        part = text[i:i+4000]
-        if reply_to_message_id and i == 0:
+        parts.append(text[i:i+4000])
+    logger.info(f"Разбито на {len(parts)} частей")
+    for idx, part in enumerate(parts):
+        if reply_to_message_id and idx == 0:
             await bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
         else:
             await bot.send_message(chat_id, part)
@@ -241,7 +245,7 @@ async def test_cmd(message: types.Message):
     await message.reply(f"✅ Бот активен (версия {VERSION})")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (ДЕДУПЛИКАЦИЯ ПО POST_ID)
+# МОНИТОРИНГ КАНАЛА (С ЛОГИРОВАНИЕМ)
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -252,19 +256,19 @@ async def handle_channel_post(post: types.Message):
         return
 
     post_id = post.message_id
-    now = time.time()
+    logger.info(f"CHANNEL_POST получен: post_id={post_id}, text={post.text[:80] if post.text else '[нет текста]'}")
 
-    # Блокировка для исключения параллельной обработки
+    now = time.time()
     lock_fd = acquire_lock()
     try:
         if post_id in processed_posts:
             last_time = processed_posts[post_id]
             if now - last_time < DUPLICATE_TIMEOUT:
-                logger.info(f"Пост {post_id} уже обработан {now-last_time:.0f} сек назад, пропускаем")
+                logger.info(f"Пропускаем пост {post_id}: уже обработан {now-last_time:.1f} сек назад")
                 return
         processed_posts[post_id] = now
         save_processed()
-        # Очистка старых записей (старше 24 часов)
+        # Очистка старых
         to_delete = [pid for pid, ts in processed_posts.items() if now - ts > 86400]
         for pid in to_delete:
             del processed_posts[pid]
@@ -277,9 +281,10 @@ async def handle_channel_post(post: types.Message):
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    logger.info(f"Обрабатываю пост {post_id}: {text[:100]}")
+    logger.info(f"Начинаем обработку поста {post_id}, текст: {text[:100]}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
     await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
+    logger.info(f"Обработка поста {post_id} завершена, комментарий отправлен")
 
 # ============================================
 # ОБЩЕНИЕ В ГРУППЕ И ЛИЧКЕ
@@ -288,6 +293,7 @@ async def handle_channel_post(post: types.Message):
 async def group_chat(message: types.Message):
     if message.chat.type in ["group", "supergroup"] and message.chat.id == TARGET_GROUP_ID:
         if message.from_user.id != bot.id and not (message.text and message.text.startswith("/")):
+            logger.info(f"Сообщение в группе от {message.from_user.id}: {message.text[:50]}")
             await bot.send_chat_action(message.chat.id, "typing")
             answer = await get_ai_response(message.from_user.id, message.text)
             await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
@@ -295,6 +301,7 @@ async def group_chat(message: types.Message):
 @dp.message()
 async def private_response(message: types.Message):
     if message.chat.type == "private" and not (message.text and message.text.startswith("/")):
+        logger.info(f"Личное сообщение от {message.from_user.id}: {message.text[:50]}")
         await bot.send_chat_action(message.chat.id, "typing")
         answer = await get_ai_response(message.from_user.id, message.text)
         await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
@@ -316,7 +323,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info(f"🚀 Запуск бота версии {VERSION} с дедупликацией по post_id")
+    logger.info(f"🚀 Запуск бота версии {VERSION} с расширенным логированием")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
