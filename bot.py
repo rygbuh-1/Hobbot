@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot – ФИНАЛЬНАЯ ВЕРСИЯ С ЖЁСТКОЙ ДЕДУПЛИКАЦИЕЙ.
-Используется блокировка на уровне файла + проверка уникального ключа.
+Исправлен синтаксис f-string.
 """
 
 import asyncio
@@ -54,13 +54,12 @@ dp = Dispatcher()
 
 # Глобальные хранилища (загружаются из файлов)
 user_history = defaultdict(list)
-processed_hashes = {}  # key: hash -> timestamp
+processed_hashes = {}
 
 # ============================================
 # ФУНКЦИИ РАБОТЫ С ФАЙЛОВЫМИ БЛОКИРОВКАМИ
 # ============================================
 def acquire_lock():
-    """Получаем эксклюзивную блокировку на файл, чтобы предотвратить параллельную обработку дублей."""
     lock_fd = open(LOCK_FILE, 'w')
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     return lock_fd
@@ -246,27 +245,21 @@ async def handle_channel_post(post: types.Message):
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
 
-    # Генерируем уникальный ключ для поста: channel_id + post_id + текст
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
     unique_key = hashlib.md5(f"{post.chat.id}:{post.message_id}:{text}".encode('utf-8')).hexdigest()
     now = time.time()
 
-    # БЛОКИРОВКА: используем файловую блокировку для исключения параллельных вызовов
     lock_fd = acquire_lock()
     try:
-        # Проверка в оперативной памяти
         if unique_key in processed_hashes:
             last_time = processed_hashes[unique_key]
             if now - last_time < DUPLICATE_TIMEOUT:
-                logger.info(f"Пост {post.message_id} (хеш {unique_key[:8]) уже обработан, пропускаем")
+                logger.info(f"Пост {post.message_id} (хеш {unique_key[:8]}) уже обработан, пропускаем")
                 return
-        # Отмечаем как обработанный
         processed_hashes[unique_key] = now
-        # Сохраняем на диск
         save_processed()
-        # Очистка старых записей
         to_delete = [k for k, ts in processed_hashes.items() if now - ts > 86400]
         for k in to_delete:
             del processed_hashes[k]
@@ -315,7 +308,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 ФИНАЛЬНЫЙ ЗАПУСК с жёсткой дедупликацией (файловая блокировка + уникальный ключ)")
+    logger.info("🚀 ФИНАЛЬНЫЙ ЗАПУСК с жёсткой дедупликацией (исправлен синтаксис f-string)")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
