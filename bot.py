@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot – ВЕРСИЯ 2.0.1 (расширенное логирование для отладки дублей).
+Telegram AI Bot – ВЕРСИЯ 2.0.2 (игнорируем пересланные из канала сообщения в группе).
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 # ============================================
 # КЛЮЧИ
@@ -41,7 +41,7 @@ PROCESSED_FILE = "processed_posts.json"
 LOCK_FILE = "processing.lock"
 
 MAX_HISTORY = 50
-DUPLICATE_TIMEOUT = 10  # 10 секунд на повторную обработку того же post_id (для теста)
+DUPLICATE_TIMEOUT = 10  # 10 секунд на повторный post_id
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -52,9 +52,8 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Глобальные хранилища
 user_history = defaultdict(list)
-processed_posts = {}  # {post_id: timestamp}
+processed_posts = {}
 
 # ============================================
 # ФАЙЛОВЫЕ БЛОКИРОВКИ
@@ -123,15 +122,10 @@ async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
             await bot.send_message(chat_id, text, reply_to_message_id=reply_to_message_id)
         else:
             await bot.send_message(chat_id, text)
-        logger.info(f"Отправлено одно сообщение (длина {len(text)})")
         return
-    # Если текст длинный, разбиваем
-    parts = []
     for i in range(0, len(text), 4000):
-        parts.append(text[i:i+4000])
-    logger.info(f"Разбито на {len(parts)} частей")
-    for idx, part in enumerate(parts):
-        if reply_to_message_id and idx == 0:
+        part = text[i:i+4000]
+        if reply_to_message_id and i == 0:
             await bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
         else:
             await bot.send_message(chat_id, part)
@@ -169,9 +163,6 @@ async def search_web(query: str, num_results: int = 3) -> str:
 
 EXPERT_PROMPT = """Ты – эксперт по ставкам на спорт. Анализируй по методологии (кадры, тактика, мотивация, усталость, верификация). Отвечай кратко – до 2500 символов. Указывай ссылки на источники. Без воды и повторов."""
 
-# ============================================
-# AI ОТВЕТ
-# ============================================
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1",
@@ -245,7 +236,7 @@ async def test_cmd(message: types.Message):
     await message.reply(f"✅ Бот активен (версия {VERSION})")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА (С ЛОГИРОВАНИЕМ)
+# МОНИТОРИНГ КАНАЛА
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -256,55 +247,69 @@ async def handle_channel_post(post: types.Message):
         return
 
     post_id = post.message_id
-    logger.info(f"CHANNEL_POST получен: post_id={post_id}, text={post.text[:80] if post.text else '[нет текста]'}")
-
+    logger.info(f"CHANNEL_POST получен: post_id={post_id}")
     now = time.time()
     lock_fd = acquire_lock()
     try:
         if post_id in processed_posts:
             last_time = processed_posts[post_id]
             if now - last_time < DUPLICATE_TIMEOUT:
-                logger.info(f"Пропускаем пост {post_id}: уже обработан {now-last_time:.1f} сек назад")
+                logger.info(f"Пропускаем пост {post_id}: уже обработан")
                 return
         processed_posts[post_id] = now
         save_processed()
-        # Очистка старых
         to_delete = [pid for pid, ts in processed_posts.items() if now - ts > 86400]
         for pid in to_delete:
             del processed_posts[pid]
         if to_delete:
             save_processed()
-            logger.info(f"Очищено {len(to_delete)} старых post_id")
     finally:
         release_lock(lock_fd)
 
     text = post.text or post.caption or ""
     if not text:
         text = "[Пост без текста]"
-    logger.info(f"Начинаем обработку поста {post_id}, текст: {text[:100]}")
+    logger.info(f"Обрабатываю пост {post_id}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
     await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
-    logger.info(f"Обработка поста {post_id} завершена, комментарий отправлен")
 
 # ============================================
-# ОБЩЕНИЕ В ГРУППЕ И ЛИЧКЕ
+# ОБЩЕНИЕ В ГРУППЕ (игнорируем пересланные из канала)
 # ============================================
 @dp.message()
 async def group_chat(message: types.Message):
-    if message.chat.type in ["group", "supergroup"] and message.chat.id == TARGET_GROUP_ID:
-        if message.from_user.id != bot.id and not (message.text and message.text.startswith("/")):
-            logger.info(f"Сообщение в группе от {message.from_user.id}: {message.text[:50]}")
-            await bot.send_chat_action(message.chat.id, "typing")
-            answer = await get_ai_response(message.from_user.id, message.text)
-            await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    if message.chat.id != TARGET_GROUP_ID:
+        return
+    if message.from_user.id == bot.id:
+        return
+    if message.text and message.text.startswith("/"):
+        return
 
+    # Ключевое исправление: игнорируем сообщения, пересланные из канала, который мы мониторим
+    if message.forward_from_chat and message.forward_from_chat.id == MONITOR_CHANNEL_ID:
+        logger.info(f"Игнорируем пересланное из канала сообщение (post_id исходного поста: {message.forward_from_message_id})")
+        return
+
+    logger.info(f"Сообщение в группе от {message.from_user.id}: {message.text[:50]}")
+    await bot.send_chat_action(message.chat.id, "typing")
+    answer = await get_ai_response(message.from_user.id, message.text)
+    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
+
+# ============================================
+# ЛИЧНЫЕ СООБЩЕНИЯ
+# ============================================
 @dp.message()
 async def private_response(message: types.Message):
-    if message.chat.type == "private" and not (message.text and message.text.startswith("/")):
-        logger.info(f"Личное сообщение от {message.from_user.id}: {message.text[:50]}")
-        await bot.send_chat_action(message.chat.id, "typing")
-        answer = await get_ai_response(message.from_user.id, message.text)
-        await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
+    if message.chat.type != "private":
+        return
+    if message.text and message.text.startswith("/"):
+        return
+    logger.info(f"Личное сообщение от {message.from_user.id}: {message.text[:50]}")
+    await bot.send_chat_action(message.chat.id, "typing")
+    answer = await get_ai_response(message.from_user.id, message.text)
+    await safe_send(message.chat.id, answer, reply_to_message_id=message.message_id)
 
 # ============================================
 # HEALTH CHECK
@@ -323,7 +328,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info(f"🚀 Запуск бота версии {VERSION} с расширенным логированием")
+    logger.info(f"🚀 Запуск бота версии {VERSION} (игнорируем пересланные из канала)")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
