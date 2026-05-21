@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Telegram AI Bot with DeepSeek – Эксперт по ставкам на спорт с авто-поиском (SerpAPI).
-Исправлены ошибки openai/httpx.
+Улучшенная защита от дублей (по ID поста + таймстамп).
 """
 
 import asyncio
 import logging
 import os
 import json
+import time
 import aiohttp
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
@@ -36,15 +37,16 @@ MONITORING_ENABLED = True
 HISTORY_FILE = "history.json"
 MAX_HISTORY = 50
 
-processed_posts = set()
-PROCESSED_POSTS_MAX = 100
+# Защита от дублей: храним {post_id: timestamp}
+processed_posts = {}
+CLEANUP_INTERVAL = 300  # чистить старые записи раз в 5 минут
+DUPLICATE_TIMEOUT = 60   # считать дубликатом в течение 60 секунд
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 user_history = defaultdict(list)
 
-# Инициализация DeepSeek без дополнительных параметров
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1",
@@ -105,26 +107,15 @@ async def search_web(query: str, num_results: int = 3) -> str:
         return "⚠️ Ошибка при поиске."
 
 # ============================================
-# ПРОМПТ ЭКСПЕРТА
+# ПРОМПТ ЭКСПЕРТА (краткий)
 # ============================================
 EXPERT_PROMPT = """Ты — профессиональный эксперт в области ставок на спорт.
-Твоя задача — анализировать матчи на основе методологии из 5 шагов и предоставленных результатов поиска.
+Анализируй матчи по методологии (кадры, тактика, мотивация, усталость, верификация).
 
-ОТВЕЧАЙ КРАТКО: не более 3000 символов, старайся уложиться в одно сообщение Telegram.
+ОТВЕЧАЙ КРАТКО: максимум 2500 символов. Всегда указывай источники (ссылки из поиска).
+Если информации нет, честно скажи об этом и посоветуй проверить составы перед матчем.
 
-Ты ОБЯЗАН использовать информацию из поисковой выдачи. Для каждого утверждения указывай источник.
-Если поиск не дал информации, честно скажи об этом и запроси данные.
-
-Не выдумывай факты. Если информации недостаточно — дай общий анализ с пометкой, что он основан на знаниях до апреля 2025.
-
-Методология (последовательно):
-1. Кадровый аудит (травмы, дисквы)
-2. Прогноз состава и тактики
-3. Турнирная мотивация
-4. Фактор усталости (календарь, перелёты)
-5. Верификация (совет проверить составы перед матчем)
-
-Будь объективен, краток, указывай ссылки."""
+Будь объективен, избегай воды, давай чёткие выводы по ставке."""
 
 # ============================================
 # ИСТОРИЯ
@@ -157,7 +148,7 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
     search_query = user_message + " травмы состав прогноз"
     search_results = await search_web(search_query, num_results=3)
     context = f"Пользователь спрашивает: {user_message}\n\n{search_results}\n\n"
-    context += "Дай краткий анализ по методологии, не более 3000 символов."
+    context += "Дай краткий анализ по методологии (до 2500 символов)."
     history = user_history[user_id][-20:]
     messages = [{"role": "system", "content": EXPERT_PROMPT}]
     messages.extend(history)
@@ -225,7 +216,7 @@ async def test_cmd(message: types.Message):
     await message.reply("✅ Бот активен")
 
 # ============================================
-# МОНИТОРИНГ КАНАЛА
+# МОНИТОРИНГ КАНАЛА (улучшенная защита от дублей)
 # ============================================
 @dp.channel_post()
 async def handle_channel_post(post: types.Message):
@@ -234,13 +225,23 @@ async def handle_channel_post(post: types.Message):
         return
     if post.chat.id != MONITOR_CHANNEL_ID:
         return
+
     post_id = post.message_id
+    now = time.time()
+    # Проверка на дубль: если post_id есть и таймстамп меньше DUPLICATE_TIMEOUT
     if post_id in processed_posts:
-        logger.info(f"Пост {post_id} уже обработан")
-        return
-    processed_posts.add(post_id)
-    if len(processed_posts) > PROCESSED_POSTS_MAX:
-        processed_posts = set(list(processed_posts)[-PROCESSED_POSTS_MAX:])
+        last_time = processed_posts[post_id]
+        if now - last_time < DUPLICATE_TIMEOUT:
+            logger.info(f"Пост {post_id} обработан {now-last_time:.1f} сек назад, пропускаем")
+            return
+    # Обновляем время обработки
+    processed_posts[post_id] = now
+    # Периодическая очистка старых записей
+    if len(processed_posts) > 100:
+        to_delete = [pid for pid, ts in processed_posts.items() if now - ts > CLEANUP_INTERVAL]
+        for pid in to_delete:
+            del processed_posts[pid]
+        logger.info(f"Очищено {len(to_delete)} старых записей")
 
     text = post.text or post.caption or ""
     if not text:
@@ -296,7 +297,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info("🚀 Бот с исправленными зависимостями запущен.")
+    logger.info("🚀 Бот с улучшенной защитой от дублей запущен.")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
