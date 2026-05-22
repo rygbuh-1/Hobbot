@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot – ВЕРСИЯ 2.0.2 (игнорируем пересланные из канала сообщения в группе).
+Telegram AI Bot – ВЕРСИЯ 2.0.3 (исправлена ошибка HTML-тегов, отключён парсинг).
 """
 
 import asyncio
@@ -10,6 +10,7 @@ import json
 import time
 import fcntl
 import aiohttp
+import html
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -17,7 +18,7 @@ from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from aiohttp import web
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 # ============================================
 # КЛЮЧИ
@@ -41,15 +42,15 @@ PROCESSED_FILE = "processed_posts.json"
 LOCK_FILE = "processing.lock"
 
 MAX_HISTORY = 50
-DUPLICATE_TIMEOUT = 10  # 10 секунд на повторный post_id
+DUPLICATE_TIMEOUT = 10
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ============================================
-# БОТ И ДИСПЕТЧЕР
+# БОТ И ДИСПЕТЧЕР (без parse_mode по умолчанию, чтобы не было проблем с HTML)
 # ============================================
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=TELEGRAM_TOKEN)  # parse_mode не задаём
 dp = Dispatcher()
 
 user_history = defaultdict(list)
@@ -112,19 +113,21 @@ load_processed()
 load_history()
 
 # ============================================
-# БЕЗОПАСНАЯ ОТПРАВКА
+# БЕЗОПАСНАЯ ОТПРАВКА (без HTML)
 # ============================================
 async def safe_send(chat_id: int, text: str, reply_to_message_id: int = None):
     if not text:
         return
-    if len(text) <= 4096:
+    # Экранируем HTML-символы, чтобы избежать ошибки парсинга
+    safe_text = html.escape(text)
+    if len(safe_text) <= 4096:
         if reply_to_message_id:
-            await bot.send_message(chat_id, text, reply_to_message_id=reply_to_message_id)
+            await bot.send_message(chat_id, safe_text, reply_to_message_id=reply_to_message_id)
         else:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, safe_text)
         return
-    for i in range(0, len(text), 4000):
-        part = text[i:i+4000]
+    for i in range(0, len(safe_text), 4000):
+        part = safe_text[i:i+4000]
         if reply_to_message_id and i == 0:
             await bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
         else:
@@ -271,7 +274,9 @@ async def handle_channel_post(post: types.Message):
         text = "[Пост без текста]"
     logger.info(f"Обрабатываю пост {post_id}")
     comment = await get_ai_response(ADMIN_ID, f"Прокомментируй пост: {text}")
-    await safe_send(TARGET_GROUP_ID, f"📢 **Пост в канале:**\n{text}\n\n💬 **Комментарий бота:**\n{comment}")
+    # Отправляем в группу, НО экранируем текст поста и комментарий
+    final_text = f"📢 Пост в канале:\n{text}\n\n💬 Комментарий бота:\n{comment}"
+    await safe_send(TARGET_GROUP_ID, final_text)
 
 # ============================================
 # ОБЩЕНИЕ В ГРУППЕ (игнорируем пересланные из канала)
@@ -287,9 +292,8 @@ async def group_chat(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
 
-    # Ключевое исправление: игнорируем сообщения, пересланные из канала, который мы мониторим
     if message.forward_from_chat and message.forward_from_chat.id == MONITOR_CHANNEL_ID:
-        logger.info(f"Игнорируем пересланное из канала сообщение (post_id исходного поста: {message.forward_from_message_id})")
+        logger.info(f"Игнорируем пересланное из канала сообщение")
         return
 
     logger.info(f"Сообщение в группе от {message.from_user.id}: {message.text[:50]}")
@@ -328,7 +332,7 @@ async def run_http():
     await asyncio.Event().wait()
 
 async def main():
-    logger.info(f"🚀 Запуск бота версии {VERSION} (игнорируем пересланные из канала)")
+    logger.info(f"🚀 Запуск бота версии {VERSION} с отключённым HTML-парсингом")
     await asyncio.gather(dp.start_polling(bot), run_http())
 
 if __name__ == "__main__":
